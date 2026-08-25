@@ -122,8 +122,9 @@ struct SidebarView: View {
         let selected = note.id == store.selection
 
         return Button {
+            // Whether you were reading or writing carries across the switch;
+            // a document with no markdown in it drops the preview by itself.
             store.selection = note.id
-            store.previewing = false
         } label: {
             HStack(alignment: .top, spacing: 9) {
                 if note.pinned {

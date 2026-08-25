@@ -1,7 +1,8 @@
 import SwiftUI
 
-/// Poe's mark: a small lantern, lit. Drawn to match the app icon so the app and
-/// the Dock read as the same object.
+/// Poe's mark: a small lantern, lit. Drawn to match the app icon — bronze frame,
+/// wire-guarded glass, a flame at the heart — so the app and the Dock read as
+/// the same object.
 struct LanternMark: View {
     var height: CGFloat = 22
     var glow: Bool = true
@@ -17,53 +18,120 @@ struct LanternMark: View {
             func rect(_ x: CGFloat, _ y: CGFloat, _ width: CGFloat, _ h: CGFloat) -> CGRect {
                 CGRect(x: x * scale, y: y * scale, width: width * scale, height: h * scale)
             }
-
-            // Handle.
-            var handle = Path()
-            handle.addArc(center: point(50, 26), radius: 16 * scale,
-                          startAngle: .degrees(180), endAngle: .degrees(0), clockwise: false)
-            context.stroke(handle, with: .color(Theme.frame), lineWidth: 6 * scale)
-
-            // Cap.
-            var cap = Path()
-            cap.move(to: point(36, 22))
-            cap.addLine(to: point(64, 22))
-            cap.addLine(to: point(78, 36))
-            cap.addLine(to: point(22, 36))
-            cap.closeSubpath()
-            context.fill(cap, with: .color(Theme.frame))
-
-            // Glass.
-            var glass = Path()
-            glass.move(to: point(29, 42))
-            glass.addCurve(to: point(29, 102), control1: point(15, 60), control2: point(15, 84))
-            glass.addLine(to: point(71, 102))
-            glass.addCurve(to: point(71, 42), control1: point(85, 84), control2: point(85, 60))
-            glass.closeSubpath()
-            context.fill(glass, with: .linearGradient(
-                Gradient(colors: [Theme.flame, Theme.lantern, Theme.lanternDeep]),
-                startPoint: point(29, 42), endPoint: point(71, 102)
-            ))
-
-            // Pane bars, clipped to the glass.
-            context.drawLayer { layer in
-                layer.clip(to: glass)
-                layer.fill(Path(rect(45, 40, 3.5, 64)), with: .color(Theme.frame.opacity(0.55)))
-                layer.fill(Path(rect(53, 40, 3.5, 64)), with: .color(Theme.frame.opacity(0.55)))
+            func bar(_ x: CGFloat, _ y: CGFloat, _ width: CGFloat, _ h: CGFloat) -> Path {
+                Path(roundedRect: rect(x, y, width, h), cornerRadius: min(width, h) * scale * 0.4)
             }
 
-            // Rings, base, foot.
-            context.fill(Path(rect(19, 35, 62, 7)), with: .color(Theme.frame))
-            context.fill(Path(rect(23, 99, 54, 7)), with: .color(Theme.frame))
+            let bronze = Theme.frame
+            let bronzeDeep = Theme.frameDeep
 
-            var base = Path()
-            base.move(to: point(27, 106))
-            base.addLine(to: point(73, 106))
-            base.addLine(to: point(64, 122))
-            base.addLine(to: point(36, 122))
-            base.closeSubpath()
-            context.fill(base, with: .color(Theme.frame))
-            context.fill(Path(rect(43, 122, 14, 6)), with: .color(Theme.frame))
+            // --- the glass, so the frame can sit on top of it ----------------
+            var glass = Path()
+            glass.move(to: point(37, 55))
+            glass.addCurve(to: point(37, 95), control1: point(30, 68), control2: point(30, 82))
+            glass.addLine(to: point(63, 95))
+            glass.addCurve(to: point(63, 55), control1: point(70, 82), control2: point(70, 68))
+            glass.closeSubpath()
+
+            context.fill(glass, with: .radialGradient(
+                Gradient(colors: [Theme.flame, Theme.lantern, Theme.lanternDeep.opacity(0.85)]),
+                center: point(50, 82), startRadius: 0, endRadius: 26 * scale
+            ))
+
+            // The flame at the heart of it.
+            var flame = Path()
+            flame.move(to: point(50, 71))
+            flame.addCurve(to: point(50, 88), control1: point(58, 80), control2: point(56, 88))
+            flame.addCurve(to: point(50, 71), control1: point(44, 88), control2: point(42, 80))
+            flame.closeSubpath()
+            context.fill(flame, with: .radialGradient(
+                Gradient(colors: [.white, Theme.flame, Theme.lantern.opacity(0.6)]),
+                center: point(50, 82), startRadius: 0, endRadius: 12 * scale
+            ))
+
+            // --- the wire guard crossing the panes ---------------------------
+            context.drawLayer { layer in
+                layer.clip(to: glass)
+                var wires = Path()
+                wires.move(to: point(35, 63)); wires.addLine(to: point(65, 87))
+                wires.move(to: point(65, 63)); wires.addLine(to: point(35, 87))
+                wires.move(to: point(34, 89)); wires.addLine(to: point(66, 89))
+                layer.stroke(wires, with: .color(bronzeDeep), lineWidth: 2.6 * scale)
+            }
+
+            // --- side rails, bowed around the glass --------------------------
+            for side in [CGFloat(-1), 1] {
+                let x = 50 + side * 28
+                var rail = Path()
+                rail.move(to: point(x - side * 4, 30))
+                rail.addCurve(to: point(x - side * 4, 100),
+                              control1: point(x + side * 3, 52),
+                              control2: point(x + side * 3, 80))
+                context.stroke(rail, with: .color(bronze), lineWidth: 3.4 * scale)
+
+                // The little pins where the rail meets the collar.
+                context.fill(bar(min(x - side * 4, x + side * 5) , 29, 9, 3), with: .color(bronzeDeep))
+            }
+
+            // --- lid, collar and burner --------------------------------------
+            var handle = Path()
+            handle.addArc(center: point(50, 13), radius: 7 * scale,
+                          startAngle: .degrees(175), endAngle: .degrees(5), clockwise: false)
+            context.stroke(handle, with: .color(bronze), lineWidth: 3 * scale)
+
+            var lid = Path()
+            lid.move(to: point(35, 19))
+            lid.addLine(to: point(65, 19))
+            lid.addLine(to: point(71, 26))
+            lid.addLine(to: point(29, 26))
+            lid.closeSubpath()
+            context.fill(lid, with: .color(bronze))
+
+            context.fill(bar(37, 26, 26, 6), with: .color(bronzeDeep))
+            context.fill(bar(35, 32, 30, 6), with: .color(bronze))
+            context.fill(bar(39, 38, 22, 9), with: .color(bronzeDeep))
+
+            // Vent holes along the burner.
+            for x in [CGFloat(43), 50, 57] {
+                context.fill(Path(ellipseIn: rect(x - 1.4, 41.5, 2.8, 2.8)),
+                             with: .color(Theme.void.opacity(0.75)))
+            }
+
+            // The skirt that flares down onto the glass.
+            var skirt = Path()
+            skirt.move(to: point(37, 47))
+            skirt.addLine(to: point(63, 47))
+            skirt.addLine(to: point(69, 56))
+            skirt.addLine(to: point(31, 56))
+            skirt.closeSubpath()
+            context.fill(skirt, with: .linearGradient(
+                Gradient(colors: [bronze, bronzeDeep]),
+                startPoint: point(31, 47), endPoint: point(69, 56)
+            ))
+
+            // --- fount, foot and the wick knob -------------------------------
+            context.fill(bar(33, 93, 34, 7), with: .color(bronze))
+
+            var fount = Path()
+            fount.move(to: point(34, 100))
+            fount.addLine(to: point(66, 100))
+            fount.addLine(to: point(63, 114))
+            fount.addLine(to: point(37, 114))
+            fount.closeSubpath()
+            context.fill(fount, with: .linearGradient(
+                Gradient(colors: [bronze, bronzeDeep]),
+                startPoint: point(34, 100), endPoint: point(66, 114)
+            ))
+            context.fill(bar(45, 96, 10, 7), with: .color(bronzeDeep))
+
+            var foot = Path()
+            foot.move(to: point(35, 114))
+            foot.addLine(to: point(65, 114))
+            foot.addLine(to: point(68, 128))
+            foot.addLine(to: point(32, 128))
+            foot.closeSubpath()
+            context.fill(foot, with: .color(bronze))
+            context.fill(bar(30, 128, 40, 5), with: .color(bronzeDeep))
         }
         .frame(width: height * design.width / design.height, height: height)
         .shadow(color: glow ? Theme.lantern.opacity(0.75) : .clear, radius: height * 0.32)

@@ -21,7 +21,8 @@ enum Theme {
     static let lantern     = Color(red: 1.000, green: 0.706, blue: 0.145)
     static let lanternDeep = Color(red: 0.980, green: 0.573, blue: 0.020)
     static let flame       = Color(red: 1.000, green: 0.965, blue: 0.812)
-    static let frame       = Color(red: 0.847, green: 0.816, blue: 0.769)
+    static let frame       = Color(red: 0.678, green: 0.596, blue: 0.502)
+    static let frameDeep   = Color(red: 0.400, green: 0.337, blue: 0.278)
 
     static let glow = LinearGradient(
         colors: [accent, accentDeep, violet],

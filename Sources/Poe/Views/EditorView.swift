@@ -138,8 +138,7 @@ struct EditorView: View {
                 documentID: store.selection,
                 focusToken: store.editorFocusToken,
                 active: !store.previewing && note != nil,
-                spellChecks: note?.kind.rendersMarkdown ?? true,
-                dense: !(note?.kind.rendersMarkdown ?? true)
+                kind: note?.kind ?? .markdown
             )
             .opacity(store.previewing ? 0 : 1)
 

@@ -1,5 +1,6 @@
 import AppKit
 import Foundation
+import QuartzCore
 
 /// Dev-only harness. POE_SNAPSHOT=<base> renders the live window to PNGs;
 /// POE_SELFTEST=1 additionally drives the app through its main flows.
@@ -64,43 +65,62 @@ enum DebugSnapshot {
             state("opened")
             let loaded = findTextView()?.string ?? ""
             check("file loads intact", loaded == before.replacingOccurrences(of: "\r\n", with: "\n"))
-            guard let textView = findTextView() else { return }
-            textView.window?.makeFirstResponder(textView)
-            textView.setSelectedRange(NSRange(location: (textView.string as NSString).length, length: 0))
-            textView.insertText("\n\nAppended by the self test.\n", replacementRange: textView.selectedRange())
+            // Markdown arrives rendered; anything else arrives ready to edit.
+            let markdown = store.selectedNote?.kind == .markdown
+            check("markdown opens rendered, other text opens editable", store.previewing == markdown)
+            if markdown { capture(to: base + "-preview.png") }
+            store.previewing = false
         }
 
-        after(start + 3.0) {
+        after(start + 2.8) {
+            capture(to: base + "-styled.png")
+            guard let textView = findTextView() else { print("SELFTEST: no editor"); return }
+            textView.window?.makeFirstResponder(textView)
+            textView.setSelectedRange(NSRange(location: (textView.string as NSString).length, length: 0))
+            textView.insertText("\n\n## Appended by the self test\n\nWith **bold** and `code`.\n", replacementRange: textView.selectedRange())
+        }
+
+        after(start + 4.3) {
             store.saveNow()
             let disk = ((try? String(contentsOf: url, encoding: .utf8)) ?? "")
                 .replacingOccurrences(of: "\r\n", with: "\n")
-            check("edit reaches disk", disk.contains("Appended by the self test."))
+            check("edit reaches disk", disk.contains("## Appended by the self test"))
             check("original text survives", disk.hasPrefix(before.replacingOccurrences(of: "\r\n", with: "\n")))
+            // Styling is attributes only: the buffer still matches the file byte for byte.
+            check("styling leaves the text alone", findTextView()?.string == disk)
             capture(to: base + "-file.png")
         }
 
-        after(start + 4.0) {
+        after(start + 5.0) { trigger("Toggle Markdown Preview") }
+
+        after(start + 5.8) {
+            check("the preview command still works", store.previewing)
+            store.previewing = false
+        }
+
+        after(start + 6.3) {
             // Opening the same file twice is one note, not two.
             let count = store.notes.count
             store.open([url])
             check("reopening doesn't duplicate", store.notes.count == count)
+            store.previewing = false
         }
 
-        after(start + 5.0) {
+        after(start + 7.3) {
             // Someone edits the file in another app while Poe is in the background.
             try? "Changed outside Poe.\n".write(to: url, atomically: true, encoding: .utf8)
             try? FileManager.default.setAttributes([.modificationDate: Date().addingTimeInterval(5)], ofItemAtPath: path)
             store.syncLinkedFiles()
         }
 
-        after(start + 6.0) {
+        after(start + 8.3) {
             check("outside change is adopted", store.selectedNote?.text == "Changed outside Poe.\n")
             // SwiftUI defers redraws while the window is occluded, so give the
             // editor a moment to catch up rather than sampling it once.
             eventually("editor shows the new text") { findTextView()?.string == "Changed outside Poe.\n" }
         }
 
-        after(start + 6.5) {
+        after(start + 8.8) {
             var bytes = Data("PNG".utf8)
             bytes.append(contentsOf: [0x00, 0x01, 0x02, 0x00])
             try? bytes.write(to: binary)
@@ -110,7 +130,7 @@ enum DebugSnapshot {
             store.message = nil
         }
 
-        after(start + 7.5) {
+        after(start + 9.8) {
             // The file goes missing under us.
             try? FileManager.default.removeItem(at: url)
             store.syncLinkedFiles()
@@ -119,7 +139,7 @@ enum DebugSnapshot {
             capture(to: base + "-missing.png")
         }
 
-        after(start + 8.0) {
+        after(start + 10.3) {
             // Keep writing and Poe puts the file back rather than losing words.
             store.currentText.wrappedValue = "Written after the file went missing.\n"
             store.saveNow()
@@ -128,7 +148,7 @@ enum DebugSnapshot {
             check("flag clears once the write lands", !store.brokenLinks.contains(store.selection ?? UUID()))
         }
 
-        after(start + 9.0) {
+        after(start + 11.5) {
             try? FileManager.default.removeItem(at: binary)
             print("SELFTEST: \(failures) failed check(s)")
             NSApp.terminate(nil)
@@ -183,9 +203,15 @@ enum DebugSnapshot {
     }
 
     private static func capture(to path: String) {
-        guard let window = mainWindow,
-              let view = window.contentView,
-              let rep = view.bitmapImageRepForCachingDisplay(in: view.bounds) else { return }
+        guard let window = mainWindow, let view = window.contentView else { return }
+        // An occluded window stops redrawing, so a capture can otherwise write a
+        // frame from several seconds ago. Bring it forward and flush first.
+        window.orderFrontRegardless()
+        NSApp.activate(ignoringOtherApps: true)
+        view.layoutSubtreeIfNeeded()
+        CATransaction.flush()
+        view.displayIfNeeded()
+        guard let rep = view.bitmapImageRepForCachingDisplay(in: view.bounds) else { return }
         view.cacheDisplay(in: view.bounds, to: rep)
         guard let data = rep.representation(using: .png, properties: [:]) else { return }
         try? data.write(to: URL(fileURLWithPath: path))

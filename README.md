@@ -55,8 +55,14 @@ to the front. **Note → Stop Editing File** keeps the text and drops the tether
 deleting the note leaves the file alone.
 
 Anything that isn't text is refused with a reason, as is anything over 8 MB.
-Markdown and plain text get the `⌘P` preview and spell-check; code and data get
-tighter line spacing and neither.
+
+Markdown and plain text are **styled as you write**: headings grow, `**bold**`,
+`*italic*`, `` `code` ``, quotes, lists, task boxes and links all take hold, and
+the syntax that produces them dims rather than disappearing — the buffer stays
+exactly the text on disk. A `.md` file opens in the rendered preview; `⌘P` (or
+the pencil) switches to editing. Code and data files get tighter line spacing
+and no styling or spell-check. Styling is scoped to what's on screen, and stands
+down entirely past 60 KB, where `⌘P` still renders the whole document.
 
 ## Where notes live
 
@@ -77,6 +83,7 @@ Sources/Poe/
   Views/SidebarView.swift
   Views/EditorView.swift
   Views/PoeTextView.swift    NSTextView wrapper (caret glow, line spacing, undo)
+  Views/MarkdownStyle.swift  Live markdown styling — attributes only, never text
   Views/MarkdownPreview.swift
   Views/LanternMark.swift    The lantern logo, drawn in Canvas
   Views/AuroraBackground.swift
@@ -140,5 +147,8 @@ swiftc Sources/Poe/Model/TextFile.swift Sources/Poe/Model/Note.swift \
   `WindowGroup` app and hands `application(_:open:)` an empty list, so
   `RootView.onOpenURL` catches most of them; the delegate still sees some.
   Opening a path already in the library re-selects it instead of cloning it.
+- The markdown preview parses in `init` and lays out lazily. It used to re-split
+  every line and build every view on each redraw, which is most of a second in a
+  100 KB note — invisible until files could be opened and one of them was large.
 - The aurora is four blurred orbs on `repeatForever` transform animations, so
   the compositor owns it and nothing spins the fans while you type.

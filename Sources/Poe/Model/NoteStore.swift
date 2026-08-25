@@ -178,7 +178,9 @@ final class NoteStore: ObservableObject {
         if let lastOpened {
             query = ""
             selection = lastOpened
-            previewing = false
+            // A markdown file arrives as a document to read; everything else —
+            // a note, a config file, code — arrives as something to edit.
+            previewing = selectedNote?.kind == .markdown
             focusEditor()
             scheduleSave()
             NSApp.activate(ignoringOtherApps: true)

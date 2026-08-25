@@ -7,10 +7,19 @@ import SwiftUI
 /// markdown parser so links, bold, italic and code all come for free.
 struct MarkdownPreview: View {
     let text: String
+    /// Parsed once per document, not once per redraw, and laid out lazily: a
+    /// long file used to re-split every line and build every view on every
+    /// single render, which is most of a second in a 100 KB note.
+    private let blocks: [Block]
+
+    init(text: String) {
+        self.text = text
+        self.blocks = Self.parse(text)
+    }
 
     var body: some View {
         ScrollView {
-            VStack(alignment: .leading, spacing: 12) {
+            LazyVStack(alignment: .leading, spacing: 12) {
                 ForEach(Array(blocks.enumerated()), id: \.offset) { _, block in
                     view(for: block)
                 }
@@ -26,7 +35,7 @@ struct MarkdownPreview: View {
 
     // MARK: - Blocks
 
-    private enum Block {
+    fileprivate enum Block {
         case heading(String, Int)
         case bullet(String)
         case quote(String)
@@ -36,7 +45,7 @@ struct MarkdownPreview: View {
         case blank
     }
 
-    private var blocks: [Block] {
+    private static func parse(_ text: String) -> [Block] {
         var result: [Block] = []
         var codeLines: [String] = []
         var inCode = false

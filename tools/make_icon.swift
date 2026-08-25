@@ -1,108 +1,50 @@
-// Draws Poe's app icon: a glowing yellow lantern on white.
-// Run with:  swift tools/make_icon.swift <output-dir>
+// Builds Poe's app icon from the master artwork in assets/AppIcon.png — the lit
+// lantern on its violet plate — masked into the macOS icon shape at every size.
+//
+// Run with:  swift tools/make_icon.swift <output-dir> [master.png]
 import AppKit
 
-func rgb(_ r: Double, _ g: Double, _ b: Double, _ a: Double = 1) -> CGColor {
-    CGColor(srgbRed: r, green: g, blue: b, alpha: a)
-}
+let sRGB = CGColorSpace(name: CGColorSpace.sRGB)!
 
-let metal      = rgb(0.145, 0.118, 0.086)          // warm charcoal frame
-let metalLight = rgb(0.255, 0.212, 0.157)
-let amber      = rgb(1.000, 0.706, 0.145)
-let amberDeep  = rgb(0.980, 0.573, 0.020)
-let core       = rgb(1.000, 0.965, 0.812)
-let sRGB       = CGColorSpace(name: CGColorSpace.sRGB)!
+let arguments = CommandLine.arguments
+let outputDir = arguments.count > 1 ? arguments[1] : "."
+let masterPath = arguments.count > 2
+    ? arguments[2]
+    : URL(fileURLWithPath: #filePath)                       // tools/make_icon.swift
+        .deletingLastPathComponent()                        // tools/
+        .deletingLastPathComponent()                        // repo root
+        .appendingPathComponent("assets/AppIcon.png").path
 
-/// The lantern, drawn in a 1024×1024 top-left origin space.
-func drawLantern(in context: CGContext) {
-    // --- glow behind the glass -------------------------------------------------
-    let heart = CGPoint(x: 512, y: 486)
-    let halo = CGGradient(colorsSpace: sRGB,
-                          colors: [amber.copy(alpha: 0.42)!,
-                                   amber.copy(alpha: 0.10)!,
-                                   amber.copy(alpha: 0)!] as CFArray,
-                          locations: [0, 0.42, 1])!
-    context.drawRadialGradient(halo, startCenter: heart, startRadius: 0,
-                               endCenter: heart, endRadius: 330, options: [])
+guard let master = NSImage(contentsOfFile: masterPath),
+      let tiff = master.tiffRepresentation,
+      let masterRep = NSBitmapImageRep(data: tiff),
+      let masterImage = masterRep.cgImage
+else { fatalError("could not read master artwork at \(masterPath)") }
 
-    // --- handle ----------------------------------------------------------------
-    let handle = CGMutablePath()
-    handle.addArc(center: CGPoint(x: 512, y: 246), radius: 86,
-                  startAngle: .pi, endAngle: 0, clockwise: false)
-    context.addPath(handle)
-    context.setStrokeColor(metal)
-    context.setLineWidth(26)
-    context.setLineCap(.round)
-    context.strokePath()
+/// The artwork ships with its own plate inside a square canvas: the plate's rim
+/// sits at 103/1024 on every side. We crop just inside that rim so none of the
+/// backdrop behind it — or the rim itself — survives into the icon.
+let plate = CGRect(x: 105, y: 105, width: 814, height: 814)
+    .applying(CGAffineTransform(scaleX: CGFloat(masterImage.width) / 1024,
+                                y: CGFloat(masterImage.height) / 1024))
+guard let art = masterImage.cropping(to: plate) else { fatalError("crop failed") }
 
-    // --- top cap ---------------------------------------------------------------
-    let cap = CGMutablePath()
-    cap.move(to: CGPoint(x: 452, y: 236))
-    cap.addLine(to: CGPoint(x: 572, y: 236))
-    cap.addLine(to: CGPoint(x: 648, y: 320))
-    cap.addLine(to: CGPoint(x: 376, y: 320))
-    cap.closeSubpath()
-    context.addPath(cap)
-    context.setFillColor(metal)
-    context.fillPath()
-
-    // --- glass: a barrel with bulging sides ------------------------------------
-    let glass = CGMutablePath()
-    glass.move(to: CGPoint(x: 402, y: 336))
-    glass.addCurve(to: CGPoint(x: 402, y: 664),
-                   control1: CGPoint(x: 344, y: 448),
-                   control2: CGPoint(x: 344, y: 552))
-    glass.addLine(to: CGPoint(x: 622, y: 664))
-    glass.addCurve(to: CGPoint(x: 622, y: 336),
-                   control1: CGPoint(x: 680, y: 552),
-                   control2: CGPoint(x: 680, y: 448))
-    glass.closeSubpath()
-
-    context.saveGState()
-    context.setShadow(offset: .zero, blur: 70, color: amberDeep.copy(alpha: 0.75))
-    context.addPath(glass)
-    context.setFillColor(amber)
-    context.fillPath()
-    context.restoreGState()
-
-    context.saveGState()
-    context.addPath(glass)
-    context.clip()
-    let fill = CGGradient(colorsSpace: sRGB,
-                          colors: [core, amber, amberDeep] as CFArray,
-                          locations: [0, 0.5, 1])!
-    context.drawLinearGradient(fill, start: CGPoint(x: 402, y: 336),
-                               end: CGPoint(x: 622, y: 664), options: [])
-
-    // The flame at the heart of it.
-    let flameGlow = CGGradient(colorsSpace: sRGB,
-                               colors: [rgb(1, 1, 1, 0.95), core.copy(alpha: 0.35)!, core.copy(alpha: 0)!] as CFArray,
-                               locations: [0, 0.5, 1])!
-    context.drawRadialGradient(flameGlow, startCenter: heart, startRadius: 0,
-                               endCenter: heart, endRadius: 132, options: [])
-
-    // Two frame bars across the panes.
-    context.setFillColor(metal.copy(alpha: 0.55)!)
-    context.fill(CGRect(x: 466, y: 336, width: 14, height: 328))
-    context.fill(CGRect(x: 546, y: 336, width: 14, height: 328))
-    context.restoreGState()
-
-    // --- rings, base, foot -----------------------------------------------------
-    context.setFillColor(metal)
-    context.fill(CGRect(x: 372, y: 318, width: 280, height: 34))
-    context.fill(CGRect(x: 386, y: 648, width: 252, height: 34))
-
-    let base = CGMutablePath()
-    base.move(to: CGPoint(x: 396, y: 682))
-    base.addLine(to: CGPoint(x: 628, y: 682))
-    base.addLine(to: CGPoint(x: 596, y: 752))
-    base.addLine(to: CGPoint(x: 428, y: 752))
-    base.closeSubpath()
-    context.addPath(base)
-    context.fillPath()
-
-    context.setFillColor(metalLight)
-    context.fill(CGRect(x: 452, y: 752, width: 120, height: 28))
+/// The macOS icon shape: a superellipse, squarer through the corners than a
+/// plain rounded rect. Sampled finely enough to stay smooth at 1024pt.
+func squircle(in rect: CGRect, exponent n: CGFloat = 5) -> CGPath {
+    let path = CGMutablePath()
+    let a = rect.width / 2, b = rect.height / 2
+    let center = CGPoint(x: rect.midX, y: rect.midY)
+    let steps = 720
+    for step in 0...steps {
+        let theta = 2 * .pi * CGFloat(step) / CGFloat(steps)
+        let c = cos(theta), s = sin(theta)
+        let x = center.x + a * pow(abs(c), 2 / n) * (c < 0 ? -1 : 1)
+        let y = center.y + b * pow(abs(s), 2 / n) * (s < 0 ? -1 : 1)
+        step == 0 ? path.move(to: CGPoint(x: x, y: y)) : path.addLine(to: CGPoint(x: x, y: y))
+    }
+    path.closeSubpath()
+    return path
 }
 
 func draw(size: CGFloat) -> Data {
@@ -113,27 +55,23 @@ func draw(size: CGFloat) -> Data {
 
     context.scaleBy(x: size / 1024, y: size / 1024)
     context.setAllowsAntialiasing(true)
+    context.interpolationQuality = .high
 
     // macOS icons sit inside a rounded square with breathing room around it.
     let inset: CGFloat = 100
-    let rect = CGRect(x: inset, y: inset, width: 1024 - inset * 2, height: 1024 - inset * 2)
-    let squircle = CGPath(roundedRect: rect, cornerWidth: 190, cornerHeight: 190, transform: nil)
+    let body = CGRect(x: inset, y: inset, width: 1024 - inset * 2, height: 1024 - inset * 2)
+    let shape = squircle(in: body)
 
     context.saveGState()
-    context.addPath(squircle)
+    context.addPath(shape)
     context.clip()
-    context.setFillColor(rgb(1, 1, 1))
-    context.fill(CGRect(x: 0, y: 0, width: 1024, height: 1024))
-
-    // Flip to a top-left origin so the lantern reads the way it is drawn.
-    context.translateBy(x: 0, y: 1024)
-    context.scaleBy(x: 1, y: -1)
-    drawLantern(in: context)
+    // A hair of overdraw so the mask's edge lands on artwork, never on nothing.
+    context.draw(art, in: body.insetBy(dx: -2, dy: -2))
     context.restoreGState()
 
-    // A whisper of a rim so the icon still has an edge on a white desktop.
-    context.addPath(squircle)
-    context.setStrokeColor(rgb(0.62, 0.55, 0.44, 0.28))
+    // A whisper of a rim so the plate still has an edge on a dark desktop.
+    context.addPath(shape)
+    context.setStrokeColor(CGColor(srgbRed: 1, green: 0.95, blue: 1, alpha: 0.10))
     context.setLineWidth(3)
     context.strokePath()
 
@@ -141,7 +79,6 @@ func draw(size: CGFloat) -> Data {
     return NSBitmapImageRep(cgImage: image).representation(using: .png, properties: [:])!
 }
 
-let outputDir = CommandLine.arguments.count > 1 ? CommandLine.arguments[1] : "."
 let iconset = URL(fileURLWithPath: outputDir).appendingPathComponent("Poe.iconset")
 try? FileManager.default.removeItem(at: iconset)
 try! FileManager.default.createDirectory(at: iconset, withIntermediateDirectories: true)

@@ -24,10 +24,18 @@ struct PoeTextView: NSViewRepresentable {
     /// False while the markdown preview is up: the view stays mounted (so undo
     /// history and scroll position survive) but must not hold the keyboard.
     var active: Bool = true
-    /// Prose gets red squiggles; a JSON file does not.
-    var spellChecks: Bool = true
-    /// Code wants its lines close together; prose wants room to breathe.
-    var dense: Bool = false
+    /// What the buffer holds, which settles three things at once: markdown is
+    /// styled as you type and spell-checked, code is neither and sits on
+    /// tighter lines.
+    var kind: FileKind = .markdown
+
+    /// Styling a document TextKit has to keep re-laying out gets expensive
+    /// somewhere north of this; beyond it the text stays plain and legible, and
+    /// ⌘P still renders the whole thing.
+    static let stylingLimit = 60_000
+
+    var styled: Bool { kind.rendersMarkdown && text.count <= Self.stylingLimit }
+    var dense: Bool { !kind.rendersMarkdown }
 
     func makeCoordinator() -> Coordinator { Coordinator(self) }
 
@@ -66,11 +74,12 @@ struct PoeTextView: NSViewRepresentable {
         textView.isAutomaticDataDetectionEnabled = false
         textView.isAutomaticLinkDetectionEnabled = false
         textView.isGrammarCheckingEnabled = false
-        textView.isContinuousSpellCheckingEnabled = spellChecks
+        textView.isContinuousSpellCheckingEnabled = styled
         textView.usesFindBar = true
         textView.isIncrementalSearchingEnabled = true
 
         context.coordinator.apply(to: textView)
+        context.coordinator.watchScrolling(of: scrollView)
         return scrollView
     }
 
@@ -78,7 +87,7 @@ struct PoeTextView: NSViewRepresentable {
         guard let textView = scrollView.documentView as? NSTextView else { return }
         context.coordinator.parent = self
 
-        textView.isContinuousSpellCheckingEnabled = spellChecks
+        textView.isContinuousSpellCheckingEnabled = styled
 
         if context.coordinator.documentID != documentID {
             // A different document. The text view is shared, so everything it was
@@ -118,6 +127,12 @@ struct PoeTextView: NSViewRepresentable {
         var parent: PoeTextView
         var focusToken: Int
         var documentID: UUID?
+        /// A full restyle is cheap but not free; typing only ever restyles the
+        /// line under the caret, and this catches up once the keys stop.
+        private var pendingRestyle: DispatchWorkItem?
+        private weak var scrollView: NSScrollView?
+        /// What the last pass covered, so scrolling within it costs nothing.
+        private var styledRange: NSRange?
         /// Where the caret was in each document, so coming back feels like
         /// returning rather than starting over.
         private var carets: [UUID: Int] = [:]
@@ -156,18 +171,97 @@ struct PoeTextView: NSViewRepresentable {
         }
 
         /// Re-stamp font, colour and spacing across the buffer after a wholesale
-        /// text replacement, which drops attributes on the floor.
+        /// text replacement, which drops attributes on the floor, then style the
+        /// markdown on top.
         func apply(to textView: NSTextView) {
             guard let storage = textView.textStorage else { return }
             let attributes = Self.attributes(dense: parent.dense)
             storage.setAttributes(attributes, range: NSRange(location: 0, length: storage.length))
             textView.typingAttributes = attributes
             textView.defaultParagraphStyle = Self.paragraphStyle(dense: parent.dense)
+            styledRange = nil
+            restyleVisible(textView, force: true)
+        }
+
+        /// Style what's on screen, plus a margin either side so scrolling never
+        /// reveals raw text. Cost stays flat however long the document is.
+        func restyleVisible(_ textView: NSTextView, force: Bool) {
+            guard parent.styled, let storage = textView.textStorage, storage.length > 0 else { return }
+            let target = visibleRange(of: textView)
+            if !force, let styled = styledRange, NSIntersectionRange(styled, target) == target { return }
+            MarkdownStyle.apply(to: storage, base: Self.attributes(dense: parent.dense), in: target)
+            styledRange = target
+        }
+
+        /// Just the paragraph under the caret — what a keystroke can change on
+        /// its own, and fast enough to do on every one of them.
+        private func restyleCaretParagraph(in textView: NSTextView) {
+            guard parent.styled, let storage = textView.textStorage, storage.length > 0 else { return }
+            let text = storage.string as NSString
+            let caret = min(textView.selectedRange().location, text.length)
+            let paragraph = text.paragraphRange(for: NSRange(location: caret, length: 0))
+            MarkdownStyle.apply(to: storage, base: Self.attributes(dense: parent.dense), in: paragraph)
+            // Everything after the edit has shifted; the old range no longer maps.
+            styledRange = nil
+        }
+
+        /// Multi-line markdown — a fence opening three lines up — only settles
+        /// once the typing pauses.
+        private func scheduleRestyle(of textView: NSTextView) {
+            pendingRestyle?.cancel()
+            let work = DispatchWorkItem { [weak self, weak textView] in
+                guard let self, let textView else { return }
+                self.restyleVisible(textView, force: true)
+            }
+            pendingRestyle = work
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.3, execute: work)
+        }
+
+        /// Style follows the scroll: whatever comes into view gets styled as it
+        /// arrives, and scrolling inside what's already styled does nothing.
+        func watchScrolling(of scrollView: NSScrollView) {
+            self.scrollView = scrollView
+            scrollView.contentView.postsBoundsChangedNotifications = true
+            NotificationCenter.default.addObserver(
+                self,
+                selector: #selector(didScroll),
+                name: NSView.boundsDidChangeNotification,
+                object: scrollView.contentView
+            )
+        }
+
+        @objc private func didScroll() {
+            guard let textView = scrollView?.documentView as? NSTextView else { return }
+            restyleVisible(textView, force: false)
+        }
+
+        private func visibleRange(of textView: NSTextView) -> NSRange {
+            guard let layoutManager = textView.layoutManager,
+                  let container = textView.textContainer,
+                  let storage = textView.textStorage else {
+                return NSRange(location: 0, length: 0)
+            }
+            let visible = textView.visibleRect
+            let glyphs = layoutManager.glyphRange(forBoundingRect: visible, in: container)
+            let characters = layoutManager.characterRange(forGlyphRange: glyphs, actualGlyphRange: nil)
+            // A screenful of slack either side, so scrolling never shows raw text.
+            let padding = 2_500
+            let start = max(0, characters.location - padding)
+            let end = min(storage.length, NSMaxRange(characters) + padding)
+            return NSRange(location: start, length: end - start)
         }
 
         func textDidChange(_ notification: Notification) {
             guard let textView = notification.object as? NSTextView else { return }
             parent.onEdit(textView.string)
+            restyleCaretParagraph(in: textView)
+            scheduleRestyle(of: textView)
+        }
+
+        deinit {
+            NotificationCenter.default.removeObserver(self)
         }
     }
 }
+
+
