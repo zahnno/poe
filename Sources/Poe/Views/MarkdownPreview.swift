@@ -7,21 +7,51 @@ import SwiftUI
 /// markdown parser so links, bold, italic and code all come for free.
 struct MarkdownPreview: View {
     let text: String
+    /// What ⌘F found, in the words the reader can see rather than the ones the
+    /// file is written in — the store searched `visibleBlocks(of:)` for these.
+    var find: Find = Find()
     /// Parsed once per document, not once per redraw, and laid out lazily: a
     /// long file used to re-split every line and build every view on every
     /// single render, which is most of a second in a 100 KB note.
     private let blocks: [Block]
+    /// Matches by the block they landed in, each with its number in the whole
+    /// document, so a block knows which of its own words is the current one.
+    private let marks: [Int: [(ordinal: Int, range: NSRange)]]
 
-    init(text: String) {
+    struct Find: Equatable {
+        var matches: [FindMatch] = []
+        /// The current match, counting from one; zero when there are none.
+        var current: Int = 0
+        /// Ticks over when the current match moves, which is when to scroll.
+        var revealToken: Int = 0
+    }
+
+    init(text: String, find: Find = Find()) {
         self.text = text
+        self.find = find
         self.blocks = Self.parse(text)
+        self.marks = Dictionary(
+            grouping: find.matches.enumerated().compactMap { ordinal, match in
+                match.block.map { (block: $0, ordinal: ordinal + 1, range: match.range) }
+            },
+            by: { $0.block }
+        ).mapValues { $0.map { (ordinal: $0.ordinal, range: $0.range) } }
     }
 
     var body: some View {
         ScrollView {
-            LazyVStack(alignment: .leading, spacing: 12) {
-                ForEach(Array(blocks.enumerated()), id: \.offset) { _, block in
-                    view(for: block)
+            ScrollViewReader { scroller in
+                LazyVStack(alignment: .leading, spacing: 12) {
+                    ForEach(Array(blocks.enumerated()), id: \.offset) { index, block in
+                        view(for: block, at: index)
+                            .id(index)
+                    }
+                }
+                .onChange(of: find.revealToken) { _ in
+                    guard let block = blockOfCurrentMatch else { return }
+                    withAnimation(.easeInOut(duration: 0.25)) {
+                        scroller.scrollTo(block, anchor: .center)
+                    }
                 }
             }
             .frame(maxWidth: 760, alignment: .leading)
@@ -31,6 +61,11 @@ struct MarkdownPreview: View {
             .textSelection(.enabled)
         }
         .scrollIndicators(.never)
+    }
+
+    private var blockOfCurrentMatch: Int? {
+        guard find.current > 0, find.current <= find.matches.count else { return nil }
+        return find.matches[find.current - 1].block
     }
 
     // MARK: - Blocks
@@ -87,11 +122,39 @@ struct MarkdownPreview: View {
         return result
     }
 
+    /// The words the reader can see, block by block — the markers gone, in the
+    /// order they're drawn. This is what ⌘F searches while the preview is up,
+    /// so a `**bold**` word is found by typing the word, not the asterisks.
+    ///
+    /// Index for index the same blocks the view lays out, so a match knows
+    /// which one it belongs to.
+    static func visibleBlocks(of text: String) -> [String] {
+        parse(text).map(visible)
+    }
+
+    private static func visible(_ block: Block) -> String {
+        switch block {
+        case .heading(let value, _), .bullet(let value), .quote(let value), .paragraph(let value):
+            return String(attributed(value).characters)
+        case .code(let value):
+            return value
+        case .rule, .blank:
+            return ""
+        }
+    }
+
+    private static func attributed(_ value: String) -> AttributedString {
+        (try? AttributedString(
+            markdown: value,
+            options: .init(interpretedSyntax: .inlineOnlyPreservingWhitespace)
+        )) ?? AttributedString(value)
+    }
+
     @ViewBuilder
-    private func view(for block: Block) -> some View {
+    private func view(for block: Block, at index: Int) -> some View {
         switch block {
         case .heading(let value, let level):
-            inline(value)
+            inline(value, at: index)
                 .font(.system(size: [26.0, 20.0, 16.0][level - 1], weight: .bold, design: .rounded))
                 .foregroundStyle(level == 1 ? AnyShapeStyle(Theme.glow) : AnyShapeStyle(Theme.ink))
                 .padding(.top, level == 1 ? 2 : 8)
@@ -101,7 +164,7 @@ struct MarkdownPreview: View {
                 Circle()
                     .fill(Theme.accent.opacity(0.75))
                     .frame(width: 4.5, height: 4.5)
-                inline(value)
+                inline(value, at: index)
                     .font(.system(size: 14.5))
                     .foregroundStyle(Theme.ink.opacity(0.92))
             }
@@ -112,14 +175,14 @@ struct MarkdownPreview: View {
                 Capsule()
                     .fill(Theme.glow)
                     .frame(width: 2.5)
-                inline(value)
+                inline(value, at: index)
                     .font(.system(size: 14.5).italic())
                     .foregroundStyle(Theme.inkDim)
             }
             .fixedSize(horizontal: false, vertical: true)
 
         case .code(let value):
-            Text(value)
+            text(value, at: index)
                 .font(.system(size: 13, design: .monospaced))
                 .foregroundStyle(Theme.accent.opacity(0.92))
                 .padding(14)
@@ -133,7 +196,7 @@ struct MarkdownPreview: View {
                 .padding(.vertical, 4)
 
         case .paragraph(let value):
-            inline(value)
+            inline(value, at: index)
                 .font(.system(size: 14.5))
                 .foregroundStyle(Theme.ink.opacity(0.92))
                 .lineSpacing(5)
@@ -143,13 +206,26 @@ struct MarkdownPreview: View {
         }
     }
 
-    private func inline(_ value: String) -> Text {
-        if let attributed = try? AttributedString(
-            markdown: value,
-            options: .init(interpretedSyntax: .inlineOnlyPreservingWhitespace)
-        ) {
-            return Text(attributed)
+    private func inline(_ value: String, at index: Int) -> Text {
+        Text(lit(Self.attributed(value), at: index))
+    }
+
+    /// Code keeps its markers — there are none to hide — but still lights up.
+    private func text(_ value: String, at index: Int) -> Text {
+        Text(lit(AttributedString(value), at: index))
+    }
+
+    /// Paint the matches this block holds. The ranges came from searching the
+    /// very characters below, so they land on the word and nothing else.
+    private func lit(_ attributed: AttributedString, at index: Int) -> AttributedString {
+        guard let found = marks[index] else { return attributed }
+        var result = attributed
+        for (ordinal, range) in found {
+            guard let converted = Range(range, in: result) else { continue }
+            let current = ordinal == find.current
+            result[converted].backgroundColor = current ? Theme.accent.opacity(0.85) : Theme.accent.opacity(0.22)
+            result[converted].foregroundColor = current ? Theme.void : Theme.ink
         }
-        return Text(value)
+        return result
     }
 }

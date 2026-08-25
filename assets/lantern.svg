@@ -1,0 +1,80 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 140" width="100" height="140" role="img" aria-label="Poe lantern">
+  <title>Poe — a lantern, lit</title>
+  <defs>
+    <radialGradient id="glassGlow" gradientUnits="userSpaceOnUse" cx="50" cy="82" r="26">
+      <stop offset="0" stop-color="#FFF6CF"/>
+      <stop offset="0.5" stop-color="#FFB425"/>
+      <stop offset="1" stop-color="#FA9205" stop-opacity="0.85"/>
+    </radialGradient>
+    <linearGradient id="flameGrad" gradientUnits="userSpaceOnUse" x1="50" y1="72" x2="50" y2="89">
+      <stop offset="0" stop-color="#FA9205"/>
+      <stop offset="0.5" stop-color="#FFB425"/>
+      <stop offset="1" stop-color="#FFFFFF"/>
+    </linearGradient>
+    <linearGradient id="skirtGrad" gradientUnits="userSpaceOnUse" x1="31" y1="47" x2="69" y2="56">
+      <stop offset="0" stop-color="#9F876C"/>
+      <stop offset="1" stop-color="#5D4C3D"/>
+    </linearGradient>
+    <linearGradient id="fountGrad" gradientUnits="userSpaceOnUse" x1="34" y1="100" x2="66" y2="114">
+      <stop offset="0" stop-color="#9F876C"/>
+      <stop offset="1" stop-color="#5D4C3D"/>
+    </linearGradient>
+    <clipPath id="glassClip">
+      <path d="M37,55 C30,68 30,82 37,95 L63,95 C70,82 70,68 63,55 Z"/>
+    </clipPath>
+    <filter id="lanternHalo" x="-70%" y="-70%" width="240%" height="240%">
+      <feGaussianBlur stdDeviation="7"/>
+    </filter>
+  </defs>
+
+  <!-- the light it throws -->
+  <ellipse cx="50" cy="78" rx="24" ry="30" fill="#FFB425" opacity="0.45" filter="url(#lanternHalo)">
+    <animate attributeName="opacity" values="0.38;0.52;0.42;0.5;0.38"
+             dur="6s" repeatCount="indefinite"/>
+  </ellipse>
+
+  <!-- the glass, so the frame can sit on top of it -->
+  <path d="M37,55 C30,68 30,82 37,95 L63,95 C70,82 70,68 63,55 Z" fill="url(#glassGlow)"/>
+
+  <!-- the flame at the heart of it -->
+  <path d="M50,72 C57,81 55,89 50,89 C45,89 43,81 50,72 Z" fill="url(#flameGrad)">
+    <animate attributeName="opacity" values="1;0.86;1;0.93;1" dur="4.5s" repeatCount="indefinite"/>
+  </path>
+
+  <!-- the wire guard crossing the panes -->
+  <g clip-path="url(#glassClip)" stroke="#5D4C3D" stroke-width="2.6" fill="none">
+    <path d="M35,63 L65,87"/>
+    <path d="M65,63 L35,87"/>
+    <path d="M34,89 L66,89"/>
+  </g>
+
+  <!-- bail arms, bowed around the glass -->
+  <g stroke="#5D4C3D" stroke-width="3.2" fill="none">
+    <path d="M28,31 C19,52 19,84 28,103"/>
+    <path d="M72,31 C81,52 81,84 72,103"/>
+  </g>
+  <rect x="19" y="30" width="9" height="3" rx="1.2" fill="#9F876C"/>
+  <rect x="72" y="30" width="9" height="3" rx="1.2" fill="#9F876C"/>
+
+  <!-- lid, collar and burner -->
+  <path d="M43.03,13.61 A7,7 0 0 1 56.97,13.61" stroke="#9F876C" stroke-width="3" fill="none"/>
+  <path d="M35,19 L65,19 L71,26 L29,26 Z" fill="#9F876C"/>
+  <rect x="37" y="26" width="26" height="6" rx="2.4" fill="#5D4C3D"/>
+  <rect x="35" y="32" width="30" height="6" rx="2.4" fill="#9F876C"/>
+  <rect x="39" y="38" width="22" height="9" rx="3.6" fill="#5D4C3D"/>
+  <g fill="#08090E" opacity="0.75">
+    <circle cx="43" cy="42.9" r="1.4"/>
+    <circle cx="50" cy="42.9" r="1.4"/>
+    <circle cx="57" cy="42.9" r="1.4"/>
+  </g>
+
+  <!-- the skirt that flares down onto the glass -->
+  <path d="M37,47 L63,47 L69,56 L31,56 Z" fill="url(#skirtGrad)"/>
+
+  <!-- fount, foot and the wick knob -->
+  <rect x="33" y="93" width="34" height="7" rx="2.8" fill="#9F876C"/>
+  <path d="M34,100 L66,100 L63,114 L37,114 Z" fill="url(#fountGrad)"/>
+  <rect x="45" y="96" width="10" height="7" rx="2.8" fill="#5D4C3D"/>
+  <path d="M35,114 L65,114 L68,128 L32,128 Z" fill="#9F876C"/>
+  <rect x="30" y="128" width="40" height="5" rx="2" fill="#5D4C3D"/>
+</svg>

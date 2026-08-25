@@ -1,26 +1,143 @@
-# Poe
+<p align="center">
+  <img src="assets/banner.svg" width="820" alt="Poe — a quiet place to think">
+</p>
+
+<p align="center">
+  <a href="#install"><img src="https://img.shields.io/badge/macOS-13%2B-0b0d14?style=flat-square&labelColor=0b0d14&color=5FE6F0" alt="macOS 13+"></a>
+  <a href="#install"><img src="https://img.shields.io/badge/Swift-5.9-0b0d14?style=flat-square&labelColor=0b0d14&color=7B8CFF" alt="Swift 5.9"></a>
+  <a href="#install"><img src="https://img.shields.io/badge/dependencies-none-0b0d14?style=flat-square&labelColor=0b0d14&color=A78BFA" alt="No dependencies"></a>
+  <a href="#windows-and-linux"><img src="https://img.shields.io/badge/Windows-not%20yet-0b0d14?style=flat-square&labelColor=0b0d14&color=98A0B6" alt="Windows: not yet"></a>
+</p>
 
 A quiet place to think — a native macOS notepad. Dark, glassy, keyboard-first,
 and it saves itself. It opens your files too: Markdown, plain text, code, or
 anything else made of text, edited in place.
 
-<p><img src="assets/icon.png" width="120" alt="Poe icon"></p>
-
 ![Poe](assets/screenshot.png)
 
-## Build
+## Install
+
+Poe is built from source. It's one Swift package with no dependencies, so this
+takes about a minute.
+
+### 1. What you need
+
+| | |
+|---|---|
+| **macOS 13** (Ventura) or later | Poe uses SwiftUI features that landed in 13 |
+| **Swift 5.9** or later | Xcode 15+, or just the Command Line Tools |
+
+The Command Line Tools are enough — you don't need the full Xcode app:
 
 ```bash
+xcode-select --install     # skip if you already have Xcode
+swift --version            # should say 5.9 or later
+```
+
+### 2. Build it
+
+```bash
+git clone https://github.com/zahnno/poe.git
+cd poe
 ./build.sh
+```
+
+`build.sh` compiles the release binary, renders the app icon from
+`assets/AppIcon.png` at every size macOS asks for, assembles `build/Poe.app`,
+and ad-hoc signs it. Try it before installing:
+
+```bash
 open build/Poe.app
 ```
 
-Requires Xcode 15 / Swift 5.9 and macOS 13 or later. No dependencies — SwiftUI,
-AppKit, and Core Graphics only. `build.sh` compiles the executable, draws the
-lantern icon from `tools/make_icon.swift`, assembles `build/Poe.app`, and
-ad-hoc signs it.
+### 3. Install it
 
-To install: `cp -R build/Poe.app /Applications/`
+```bash
+cp -R build/Poe.app /Applications/
+```
+
+That's the whole install. Poe keeps its notes in
+`~/Library/Application Support/Poe/`, writes nothing else, and phones nowhere.
+
+<details>
+<summary><b>Building a universal binary (Apple silicon + Intel)</b></summary>
+
+`build.sh` builds for the Mac you're on. To produce one app that runs on both:
+
+```bash
+swift build -c release --arch arm64 --arch x86_64
+cp .build/apple/Products/Release/Poe build/Poe.app/Contents/MacOS/Poe
+codesign --force --sign - build/Poe.app
+```
+
+Run `./build.sh` first so the bundle exists to copy into.
+</details>
+
+<details>
+<summary><b>"Poe can't be opened because Apple cannot check it"</b></summary>
+
+Poe is signed ad-hoc — with no Apple Developer certificate — because it's built
+on your own machine. macOS is fine with that for an app you compiled yourself.
+You'll only see the warning if the `.app` reached you as a *download* (a zip
+from someone else, say), which puts it in quarantine:
+
+```bash
+xattr -dr com.apple.quarantine /Applications/Poe.app
+```
+
+Or right-click the app → **Open** → **Open**, once.
+</details>
+
+<details>
+<summary><b>Updating and uninstalling</b></summary>
+
+Update:
+
+```bash
+git pull && ./build.sh && cp -R build/Poe.app /Applications/
+```
+
+Quit Poe first — copying over a running app confuses macOS. Your notes live
+outside the bundle and survive.
+
+Uninstall:
+
+```bash
+rm -rf /Applications/Poe.app
+rm -rf ~/Library/Application\ Support/Poe   # only if you want the notes gone too
+```
+</details>
+
+## Windows and Linux
+
+**Not today, and not without real work.** Being straight about why, since the
+answer decides whether it's worth starting:
+
+Poe isn't merely *compiled* for macOS — it's *made of* macOS. The window is
+SwiftUI, the editor is an `NSTextView` from AppKit with a custom caret and layout
+manager, the icon and the lantern are drawn in Core Graphics, and the file layer
+speaks `UniformTypeIdentifiers`. Swift itself runs beautifully on Windows and
+Linux; SwiftUI and AppKit are Apple-only and aren't coming. There's no build
+flag, no compatibility shim, and no VM trick — a `.app` is not a thing Windows
+knows how to run.
+
+What a port would actually mean:
+
+| Layer | Lines | Portable? |
+|---|---|---|
+| `Model/Note.swift` | 91 | **Yes** — pure Foundation, compiles as-is |
+| `Model/TextFile.swift` | 199 | **Nearly** — Foundation, plus one `UTType` call to swap for extension matching |
+| `Model/NoteStore.swift` | 475 | Mostly — the persistence and command logic is portable; the open/save panels aren't |
+| Everything in `Views/` + `Theme.swift` | ~1,850 | **No** — rewrite against a Windows UI toolkit |
+| `tools/make_icon.swift` | — | No — Core Graphics |
+
+So about a quarter of the code crosses over unchanged, and the interesting part —
+an editor that styles markdown live without ever touching the buffer — has to be
+rebuilt on WinUI 3, Qt, or Electron. That's a fork sharing a model layer, not a
+build flag.
+
+If you want it, open an issue and say which toolkit; the model layer is already
+clean enough to lift out into its own target.
 
 ## Shortcuts
 
@@ -28,7 +145,10 @@ To install: `cp -R build/Poe.app /Applications/`
 |---|---|
 | `⌘N` | New note |
 | `⌘O` | Open a file |
-| `⌘F` | Search every note |
+| `⌘F` | Find in this note |
+| `⌘G` / `⇧⌘G` | Next / previous match |
+| `⌘E` | Use the selection as the search term |
+| `⇧⌘F` | Search every note |
 | `⌘P` | Toggle markdown preview |
 | `⌘D` | Pin / unpin |
 | `⇧⌘D` | Duplicate |
@@ -85,11 +205,13 @@ Sources/Poe/
   Views/PoeTextView.swift    NSTextView wrapper (caret glow, line spacing, undo)
   Views/MarkdownStyle.swift  Live markdown styling — attributes only, never text
   Views/MarkdownPreview.swift
-  Views/LanternMark.swift    The lantern logo, drawn in Canvas
+  Views/FindBar.swift        Find in note — ⌘F, match stepping, selection sync
+  Views/LanternMark.swift    The lantern logo, drawn in Canvas to match the icon
   Views/AuroraBackground.swift
   DebugSnapshot.swift   Dev-only smoke test (see below)
-tools/make_icon.swift   Draws the app icon at every size
+tools/make_icon.swift   Cuts the app icon out of assets/AppIcon.png, every size
 tools/file_tests/       Headless checks for the file layer (see below)
+assets/lantern.svg      The mark again, as SVG — same geometry, same bronze
 ```
 
 ## Smoke test

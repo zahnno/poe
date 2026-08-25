@@ -13,6 +13,10 @@ struct EditorView: View {
     var body: some View {
         VStack(spacing: 0) {
             topBar
+            if store.findVisible {
+                FindBar()
+                    .transition(.move(edge: .top).combined(with: .opacity))
+            }
             Divider().overlay(Theme.hairline)
             content
             Divider().overlay(Theme.hairline)
@@ -66,6 +70,14 @@ struct EditorView: View {
                 }
                 .buttonStyle(IconButtonStyle(active: note.pinned))
                 .help(note.pinned ? "Unpin (⌘D)" : "Pin (⌘D)")
+            }
+
+            if note != nil {
+                Button { store.toggleFind() } label: {
+                    Image(systemName: "text.magnifyingglass")
+                }
+                .buttonStyle(IconButtonStyle(active: store.findVisible))
+                .help("Find in this note (⌘F)")
             }
 
             Button {
@@ -138,7 +150,18 @@ struct EditorView: View {
                 documentID: store.selection,
                 focusToken: store.editorFocusToken,
                 active: !store.previewing && note != nil,
-                kind: note?.kind ?? .markdown
+                kind: note?.kind ?? .markdown,
+                find: PoeTextView.FindState(
+                    active: store.findVisible && !store.previewing,
+                    matches: store.findMatches,
+                    current: store.findIndex,
+                    revealToken: store.findRevealToken
+                ),
+                onEscape: { [store] in
+                    guard store.findVisible else { return false }
+                    store.hideFind()
+                    return true
+                }
             )
             .opacity(store.previewing ? 0 : 1)
 
@@ -152,8 +175,15 @@ struct EditorView: View {
             }
 
             if store.previewing {
-                MarkdownPreview(text: store.currentText.wrappedValue)
-                    .transition(.opacity)
+                MarkdownPreview(
+                    text: store.currentText.wrappedValue,
+                    find: MarkdownPreview.Find(
+                        matches: store.findVisible ? store.findMatches : [],
+                        current: store.findIndex,
+                        revealToken: store.findRevealToken
+                    )
+                )
+                .transition(.opacity)
             }
 
             if note == nil {

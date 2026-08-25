@@ -3,6 +3,18 @@ import Foundation
 import SwiftUI
 import UniformTypeIdentifiers
 
+/// Where one search match is.
+///
+/// A match in the editor is a range in the buffer. A match in the markdown
+/// preview is a range inside one of the blocks the reader can see, since that
+/// text — headings without their hashes, bold without its asterisks — is not
+/// the text the file holds.
+struct FindMatch: Equatable {
+    var range: NSRange
+    /// The rendered block the range belongs to; nil when it's the raw text.
+    var block: Int?
+}
+
 /// Owns every note, persists them to disk, and drives the UI.
 ///
 /// Notes live in a single JSON document under Application Support. Writes are
@@ -27,14 +39,62 @@ final class NoteStore: ObservableObject {
         didSet {
             // A code or data file has no markdown to preview.
             if previewing, !(selectedNote?.kind.rendersMarkdown ?? true) { previewing = false }
+            // A different document: the same word, counted afresh from the top,
+            // since the caret we'd otherwise start from belongs to the last one.
+            if oldValue != selection { refreshFind(reveal: true, from: 0) }
         }
     }
 
     @Published var sidebarVisible: Bool = true
-    @Published var previewing: Bool = false
+    @Published var previewing: Bool = false {
+        didSet {
+            // Reading and writing show different words — the same search has to
+            // be counted again against whichever is on screen.
+            if previewing != oldValue, findVisible { refreshFind(reveal: true, from: 0) }
+        }
+    }
     @Published var pendingDelete: Note?
     @Published var searchFocusToken: Int = 0
     @Published var editorFocusToken: Int = 0
+
+    // MARK: Find in the open document
+    //
+    // The sidebar's `query` sifts the whole library; this is the other search —
+    // a find bar over the one document that is open, the way ⌘F behaves in every
+    // other editor. The text view owns the matching, so what lives here is only
+    // what the bar draws and the commands that drive it.
+
+    @Published var findVisible: Bool = false
+    @Published var findQuery: String = "" {
+        didSet { if findQuery != oldValue { refreshFind(reveal: true) } }
+    }
+    /// Every match in the open document, in UTF-16 — the units both the editor
+    /// and `AttributedString` count in — so nothing has to search twice.
+    @Published private(set) var findMatches: [FindMatch] = []
+    /// Which match is current, counting from one; zero when there are none.
+    @Published private(set) var findIndex: Int = 0
+    /// True when a document had more matches than we were willing to collect —
+    /// the bar says so rather than quietly reporting a smaller number.
+    @Published private(set) var findCapped: Bool = false
+    @Published var findFocusToken: Int = 0
+    /// Bumped only when the current match moves on purpose — a new search, or
+    /// ⌘G. Typing in the document recounts without dragging the view anywhere.
+    @Published private(set) var findRevealToken: Int = 0
+
+    var findCount: Int { findMatches.count }
+
+    /// Past this many characters, a document is recounted once the typing
+    /// pauses rather than on every keystroke: a full pass over 8 MB costs an
+    /// eighth of a second, which the writer would feel.
+    private static let instantFindLimit = 200_000
+    /// And past this many matches we stop collecting. Nothing useful happens
+    /// beyond it, and the list itself starts to cost more than the search.
+    private static let findMatchLimit = 20_000
+    private var findRecount: Task<Void, Never>?
+    /// The rendered text of the document being searched, kept between
+    /// keystrokes: the markdown behind a long note is parsed once, not once per
+    /// letter typed into the find field.
+    private var rendered: (text: String, blocks: [String])?
 
     /// Linked notes whose file has moved, been deleted, or refused a write.
     @Published var brokenLinks: Set<UUID> = []
@@ -54,6 +114,11 @@ final class NoteStore: ObservableObject {
     // MARK: - Location
 
     static let directory: URL = {
+        // The self test points this somewhere disposable: a harness that types
+        // into notes must never be pointed at the real ones.
+        if let scratch = ProcessInfo.processInfo.environment["POE_LIBRARY"], !scratch.isEmpty {
+            return URL(fileURLWithPath: scratch, isDirectory: true)
+        }
         let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first
             ?? FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Application Support")
         return base.appendingPathComponent("Poe", isDirectory: true)
@@ -140,6 +205,9 @@ final class NoteStore: ObservableObject {
                 self.notes[index].text = newValue
                 self.notes[index].updated = Date()
                 self.scheduleSave()
+                // Every match past the edit has shifted; keep the tally honest,
+                // but don't yank the view off to one of them.
+                if self.findVisible { self.scheduleFindRecount(length: newValue.utf16.count) }
             }
         )
     }
@@ -400,6 +468,143 @@ final class NoteStore: ObservableObject {
         editorFocusToken &+= 1
     }
 
+    // MARK: - Find in the open document
+
+    /// ⌘F. Searches whatever is on screen: the text you're writing, or — with
+    /// the preview up — the words as they're rendered, markers and all left out
+    /// of it. Reading never has to become editing to find something.
+    func showFind() {
+        guard selectedNote != nil else { return }
+        withAnimation(.easeOut(duration: 0.18)) { findVisible = true }
+        findFocusToken &+= 1
+        refreshFind(reveal: true)
+    }
+
+    func hideFind() {
+        guard findVisible else { return }
+        withAnimation(.easeOut(duration: 0.18)) { findVisible = false }
+        findRecount?.cancel()
+        findMatches = []
+        findIndex = 0
+        findCapped = false
+        rendered = nil
+        focusEditor()
+    }
+
+    func toggleFind() {
+        // ⌘F on an open bar puts the cursor back in it and selects what's there,
+        // rather than closing the thing you just asked for.
+        if findVisible { findFocusToken &+= 1 } else { showFind() }
+    }
+
+    func findNext() { step(find: 1) }
+    func findPrevious() { step(find: -1) }
+
+    private func step(find direction: Int) {
+        guard selectedNote != nil else { return }
+        guard findVisible, !findQuery.isEmpty else { return showFind() }
+        guard !findMatches.isEmpty else { return }
+        // Off either end and you come round the other side.
+        findIndex = (findIndex - 1 + direction + findMatches.count) % findMatches.count + 1
+        findRevealToken &+= 1
+    }
+
+    /// Count the matches in the open document.
+    ///
+    /// A fresh search starts from the caret — the line the writer is already
+    /// looking at — and wraps round to the top if there's nothing below it. A
+    /// recount after an edit keeps whichever match you were on.
+    private func refreshFind(reveal: Bool, from anchor: Int? = nil) {
+        findRecount?.cancel()
+
+        guard findVisible, !findQuery.isEmpty, let text = selectedNote?.text else {
+            findMatches = []
+            findIndex = 0
+            findCapped = false
+            return
+        }
+
+        findMatches = matches(in: text)
+        findCapped = findMatches.count >= Self.findMatchLimit
+        guard !findMatches.isEmpty else {
+            findIndex = 0
+            return
+        }
+
+        if reveal {
+            // From the caret when there's a caret to start from; a reader has
+            // none, so a search of the preview starts at the top.
+            let caret = readingRendered ? 0 : anchor ?? EditorTextView.current?.selectedRange().location ?? 0
+            findIndex = (findMatches.firstIndex { $0.range.location >= caret } ?? 0) + 1
+            findRevealToken &+= 1
+        } else {
+            findIndex = min(max(findIndex, 1), findMatches.count)
+        }
+    }
+
+    /// True when what's on screen is the rendered markdown rather than the text.
+    private var readingRendered: Bool {
+        previewing && (selectedNote?.kind.rendersMarkdown ?? false)
+    }
+
+    /// Search whichever text the reader is actually looking at.
+    private func matches(in text: String) -> [FindMatch] {
+        guard readingRendered else {
+            return Self.ranges(of: findQuery, in: text as NSString)
+                .map { FindMatch(range: $0, block: nil) }
+        }
+
+        var found: [FindMatch] = []
+        for (index, block) in visibleBlocks(of: text).enumerated() {
+            guard found.count < Self.findMatchLimit else { break }
+            found += Self.ranges(of: findQuery, in: block as NSString)
+                .map { FindMatch(range: $0, block: index) }
+        }
+        return found
+    }
+
+    /// Recount after an edit. A note is counted there and then; a document big
+    /// enough for the pass to be felt waits for the keys to stop.
+    private func scheduleFindRecount(length: Int) {
+        guard length > Self.instantFindLimit else { return refreshFind(reveal: false) }
+        findRecount?.cancel()
+        findRecount = Task { [weak self] in
+            try? await Task.sleep(nanoseconds: 250_000_000)
+            guard !Task.isCancelled else { return }
+            self?.refreshFind(reveal: false)
+        }
+    }
+
+    private func visibleBlocks(of text: String) -> [String] {
+        if let rendered, rendered.text == text { return rendered.blocks }
+        let blocks = MarkdownPreview.visibleBlocks(of: text)
+        rendered = (text, blocks)
+        return blocks
+    }
+
+    /// Every occurrence, ignoring case and accents — the same forgiving match
+    /// the sidebar's search uses.
+    private static func ranges(of query: String, in text: NSString) -> [NSRange] {
+        var found: [NSRange] = []
+        var start = 0
+        let options: NSString.CompareOptions = [.caseInsensitive, .diacriticInsensitive]
+        while start < text.length, found.count < findMatchLimit {
+            let searched = NSRange(location: start, length: text.length - start)
+            let range = text.range(of: query, options: options, range: searched)
+            guard range.location != NSNotFound, range.length > 0 else { break }
+            found.append(range)
+            start = NSMaxRange(range)
+        }
+        return found
+    }
+
+    /// ⌘E — take what's selected in the editor as the thing to find.
+    func useSelectionForFind() {
+        guard let selected = EditorTextView.selectedText, !selected.isEmpty else { return }
+        findQuery = selected
+        showFind()
+    }
+
     /// Write the note out to a file of the user's choosing — and keep writing
     /// there from then on, the way Save As has always behaved.
     func saveSelectedAs() {
@@ -458,7 +663,8 @@ final class NoteStore: ObservableObject {
     ## Shortcuts
     - Cmd N — new note
     - Cmd O — open a file (.md, .txt, code, anything text)
-    - Cmd F — search every note
+    - Cmd F — find inside this note
+    - Shift Cmd F — search every note
     - Cmd P — preview markdown
     - Cmd D — pin the current note
     - Cmd 0 — hide the sidebar for focus mode

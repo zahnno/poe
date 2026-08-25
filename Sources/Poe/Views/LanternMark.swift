@@ -40,13 +40,13 @@ struct LanternMark: View {
 
             // The flame at the heart of it.
             var flame = Path()
-            flame.move(to: point(50, 71))
-            flame.addCurve(to: point(50, 88), control1: point(58, 80), control2: point(56, 88))
-            flame.addCurve(to: point(50, 71), control1: point(44, 88), control2: point(42, 80))
+            flame.move(to: point(50, 72))
+            flame.addCurve(to: point(50, 89), control1: point(57, 81), control2: point(55, 89))
+            flame.addCurve(to: point(50, 72), control1: point(45, 89), control2: point(43, 81))
             flame.closeSubpath()
-            context.fill(flame, with: .radialGradient(
-                Gradient(colors: [.white, Theme.flame, Theme.lantern.opacity(0.6)]),
-                center: point(50, 82), startRadius: 0, endRadius: 12 * scale
+            context.fill(flame, with: .linearGradient(
+                Gradient(colors: [Theme.lanternDeep, Theme.lantern, .white]),
+                startPoint: point(50, 72), endPoint: point(50, 89)
             ))
 
             // --- the wire guard crossing the panes ---------------------------
@@ -59,18 +59,18 @@ struct LanternMark: View {
                 layer.stroke(wires, with: .color(bronzeDeep), lineWidth: 2.6 * scale)
             }
 
-            // --- side rails, bowed around the glass --------------------------
+            // --- bail arms, bowed around the glass ---------------------------
             for side in [CGFloat(-1), 1] {
-                let x = 50 + side * 28
                 var rail = Path()
-                rail.move(to: point(x - side * 4, 30))
-                rail.addCurve(to: point(x - side * 4, 100),
-                              control1: point(x + side * 3, 52),
-                              control2: point(x + side * 3, 80))
-                context.stroke(rail, with: .color(bronze), lineWidth: 3.4 * scale)
+                rail.move(to: point(50 + side * 22, 31))
+                rail.addCurve(to: point(50 + side * 22, 103),
+                              control1: point(50 + side * 31, 52),
+                              control2: point(50 + side * 31, 84))
+                context.stroke(rail, with: .color(bronzeDeep), lineWidth: 3.2 * scale)
 
-                // The little pins where the rail meets the collar.
-                context.fill(bar(min(x - side * 4, x + side * 5) , 29, 9, 3), with: .color(bronzeDeep))
+                // The little pins where the arm meets the collar.
+                let pin = side < 0 ? CGFloat(19) : 72
+                context.fill(bar(pin, 30, 9, 3), with: .color(bronze))
             }
 
             // --- lid, collar and burner --------------------------------------

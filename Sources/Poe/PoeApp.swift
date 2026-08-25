@@ -70,10 +70,25 @@ struct PoeApp: App {
             }
             .keyboardShortcut("0", modifiers: .command)
 
-            Button("Search Notes") { store.focusSearch() }
-                .keyboardShortcut("f", modifiers: .command)
-
             Divider()
+        }
+
+        // ⌘F belongs to the document you're reading, the way it does in every
+        // other editor; the library's own search keeps the sidebar and moves to
+        // ⇧⌘F. Replacing the group takes AppKit's own Find submenu — and its
+        // claim on ⌘F — out of the Edit menu with it.
+        CommandGroup(replacing: .textEditing) {
+            Button("Find in Note…") { store.toggleFind() }
+                .keyboardShortcut("f", modifiers: .command)
+            Button("Find Next") { store.findNext() }
+                .keyboardShortcut("g", modifiers: .command)
+            Button("Find Previous") { store.findPrevious() }
+                .keyboardShortcut("g", modifiers: [.command, .shift])
+            Button("Use Selection for Find") { store.useSelectionForFind() }
+                .keyboardShortcut("e", modifiers: .command)
+            Divider()
+            Button("Search All Notes") { store.focusSearch() }
+                .keyboardShortcut("f", modifiers: [.command, .shift])
         }
 
         CommandGroup(replacing: .help) {

@@ -20,6 +20,12 @@ enum DebugSnapshot {
             return
         }
 
+        // POE_SELFTEST=find exercises ⌘F: find inside the open note.
+        if scenario == "find" {
+            findFlow(base: base)
+            return
+        }
+
         after(2.0) {
             guard let textView = findTextView() else { print("SELFTEST: no editor"); return }
             textView.window?.makeFirstResponder(textView)
@@ -80,7 +86,7 @@ enum DebugSnapshot {
             textView.insertText("\n\n## Appended by the self test\n\nWith **bold** and `code`.\n", replacementRange: textView.selectedRange())
         }
 
-        after(start + 4.3) {
+        after(start + 5.1) {
             store.saveNow()
             let disk = ((try? String(contentsOf: url, encoding: .utf8)) ?? "")
                 .replacingOccurrences(of: "\r\n", with: "\n")
@@ -91,7 +97,7 @@ enum DebugSnapshot {
             capture(to: base + "-file.png")
         }
 
-        after(start + 5.0) { trigger("Toggle Markdown Preview") }
+        after(start + 5.8) { trigger("Toggle Markdown Preview") }
 
         after(start + 5.8) {
             check("the preview command still works", store.previewing)
@@ -150,6 +156,142 @@ enum DebugSnapshot {
 
         after(start + 11.5) {
             try? FileManager.default.removeItem(at: binary)
+            print("SELFTEST: \(failures) failed check(s)")
+            NSApp.terminate(nil)
+        }
+    }
+
+    /// ⌘F end to end: count the matches, step through them, wrap round, keep
+    /// counting as the writer types — and leave every character alone.
+    ///
+    /// The word below appears exactly six times, counting the shouted one.
+    private static func findFlow(base: String, start: Double = 2.0) {
+        let store = NoteStore.shared
+        let text = """
+        Lantern notes
+
+        A lantern in the dark, a lantern on the desk, and a lantern in the window.
+
+        The word lantern turns up six times here — the last one being this LANTERN.
+
+        Written **bright** star, with the emphasis in the way.
+        """
+
+        after(start - 0.5) {
+            // The point of the whole exercise: ⌘F reaches the document, and the
+            // library's search is still there, one key over.
+            check("⌘F is Find in Note… (\(shortcutOwner("f", [.command]) ?? "nothing"))",
+                  shortcutOwner("f", [.command]) == "Find in Note…")
+            check("⇧⌘F is Search All Notes (\(shortcutOwner("f", [.command, .shift]) ?? "nothing"))",
+                  shortcutOwner("f", [.command, .shift]) == "Search All Notes")
+            check("⌘G is Find Next", shortcutOwner("g", [.command]) == "Find Next")
+            check("⇧⌘G is Find Previous", shortcutOwner("g", [.command, .shift]) == "Find Previous")
+            check("⌘E is Use Selection for Find", shortcutOwner("e", [.command]) == "Use Selection for Find")
+        }
+
+        // A note of its own, so the counts below are only ever about this text.
+        after(start) { trigger("New Note") }
+
+        after(start + 0.8) {
+            guard let textView = findTextView() else { return check("editor exists", false) }
+            textView.window?.makeFirstResponder(textView)
+            textView.insertText(text, replacementRange: NSRange(location: 0, length: 0))
+        }
+
+        // ⌘F while reading: the markdown stays rendered and the words on screen
+        // are what gets searched — markers and all left out of it.
+        after(start + 1.6) { store.previewing = true }
+
+        after(start + 2.0) { trigger("Find in Note…") }
+
+        after(start + 2.6) {
+            check("⌘F opens the find bar", store.findVisible)
+            check("reading stays reading", store.previewing)
+            store.findQuery = "lantern"
+        }
+
+        after(start + 3.6) {
+            check("the preview is searched where it stands (\(store.findCount))", store.findCount == 6)
+            check("every match knows its block", store.findMatches.allSatisfy { $0.block != nil })
+            check("the first match is current (\(store.findIndex))", store.findIndex == 1)
+            check("nothing is lit in the editor behind it", !lit(at: 0))
+            capture(to: base + "-find-preview.png")
+            store.previewing = false
+        }
+
+        after(start + 4.4) {
+            check("the same words are found in the text (\(store.findCount))", store.findCount == 6)
+            check("and now they point at the buffer", store.findMatches.allSatisfy { $0.block == nil })
+            check("finding a word doesn't sift the library", store.query.isEmpty)
+            check("the match is lit", lit(at: store.findMatches.first?.range.location ?? -1))
+            check("the words around it aren't", !lit(at: 10))
+            capture(to: base + "-find.png")
+            trigger("Find Next")
+        }
+
+        after(start + 5.2) {
+            check("⌘G steps forward (\(store.findIndex))", store.findIndex == 2)
+            trigger("Find Previous")
+        }
+
+        after(start + 6.0) {
+            check("⇧⌘G steps back (\(store.findIndex))", store.findIndex == 1)
+            trigger("Find Previous")
+        }
+
+        after(start + 6.8) {
+            check("stepping back off the front wraps to the end (\(store.findIndex))", store.findIndex == 6)
+            check("searching leaves the text alone", findTextView()?.string == text)
+            guard let textView = findTextView() else { return }
+            textView.window?.makeFirstResponder(textView)
+            textView.setSelectedRange(NSRange(location: (textView.string as NSString).length, length: 0))
+            textView.insertText("\n\nOne more lantern.", replacementRange: textView.selectedRange())
+        }
+
+        after(start + 7.8) {
+            eventually("typing keeps the count honest") { store.findCount == 7 }
+        }
+
+        // The point of searching what's rendered: the reader looks for the words
+        // as they read, not as they're written.
+        after(start + 8.6) {
+            store.previewing = true
+            store.findQuery = "bright star"
+        }
+
+        after(start + 9.4) {
+            check("a phrase the markers interrupt is found in the preview (\(store.findCount))", store.findCount == 1)
+            store.previewing = false
+        }
+
+        after(start + 10.2) {
+            check("and isn't in the text, where the asterisks are", store.findCount == 0)
+            trigger("Search All Notes")
+        }
+
+        after(start + 11.0) {
+            check("⇧⌘F still searches every note", store.sidebarVisible)
+            check("the library search is a separate field", store.query.isEmpty && !store.findQuery.isEmpty)
+
+            // ⌘E: take the word under the selection as the thing to find.
+            guard let textView = findTextView() else { return }
+            textView.window?.makeFirstResponder(textView)
+            textView.setSelectedRange((textView.string as NSString).range(of: "desk"))
+            trigger("Use Selection for Find")
+        }
+
+        after(start + 11.8) {
+            check("⌘E searches for what's selected", store.findQuery == "desk")
+            check("and counts it", store.findCount == 1 && store.findIndex == 1)
+            guard let textView = findTextView() else { return }
+            textView.window?.makeFirstResponder(textView)
+            textView.doCommand(by: #selector(NSResponder.cancelOperation(_:)))
+        }
+
+        after(start + 12.6) {
+            check("esc closes the bar from the editor", !store.findVisible)
+            check("closing forgets the matches", store.findCount == 0)
+            capture(to: base + "-find-closed.png")
             print("SELFTEST: \(failures) failed check(s)")
             NSApp.terminate(nil)
         }
@@ -236,6 +378,36 @@ enum DebugSnapshot {
             if let found = search(child) { return found }
         }
         return nil
+    }
+
+    /// Matches are drawn as temporary attributes on the layout manager — this
+    /// is the only place the difference between that and editing the text shows.
+    private static func lit(at index: Int) -> Bool {
+        guard index >= 0, let layoutManager = findTextView()?.layoutManager else { return false }
+        return layoutManager.temporaryAttribute(.backgroundColor, atCharacterIndex: index, effectiveRange: nil) != nil
+    }
+
+    /// Which menu item a key stroke would actually reach — the first match in
+    /// menu order, which is how AppKit itself resolves one.
+    private static func shortcutOwner(_ key: String, _ flags: NSEvent.ModifierFlags) -> String? {
+        func search(_ menu: NSMenu) -> String? {
+            menu.update()
+            for item in menu.items {
+                if item.keyEquivalent.lowercased() == key, modifiers(of: item) == flags { return item.title }
+                if let submenu = item.submenu, let found = search(submenu) { return found }
+            }
+            return nil
+        }
+        guard let main = NSApp.mainMenu else { return nil }
+        return search(main)
+    }
+
+    /// An uppercase key equivalent carries the shift the mask doesn't mention.
+    private static func modifiers(of item: NSMenuItem) -> NSEvent.ModifierFlags {
+        var flags = item.keyEquivalentModifierMask.intersection([.command, .shift, .option, .control])
+        let key = item.keyEquivalent
+        if key != key.lowercased() { flags.insert(.shift) }
+        return flags
     }
 
     private static func trigger(_ title: String) {

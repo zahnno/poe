@@ -28,6 +28,27 @@ struct PoeTextView: NSViewRepresentable {
     /// styled as you type and spell-checked, code is neither and sits on
     /// tighter lines.
     var kind: FileKind = .markdown
+    /// What the find bar found. The store does the searching — it holds the
+    /// text — and the editor only lights the matches and scrolls to one.
+    var find: FindState = FindState()
+    /// Esc with the find bar up. Returns true if there was a bar to close.
+    var onEscape: () -> Bool = { false }
+
+    /// Everything the editor needs to draw a search, as one comparable value.
+    struct FindState: Equatable {
+        var active: Bool = false
+        var matches: [FindMatch] = []
+        /// The current match, counting from one; zero when there are none.
+        var current: Int = 0
+        /// Ticks over when the current match moves on purpose, and only then —
+        /// a recount after a keystroke must not scroll the writer away.
+        var revealToken: Int = 0
+
+        var currentRange: NSRange? {
+            guard current > 0, current <= matches.count else { return nil }
+            return matches[current - 1].range
+        }
+    }
 
     /// Styling a document TextKit has to keep re-laying out gets expensive
     /// somewhere north of this; beyond it the text stays plain and legible, and
@@ -121,6 +142,8 @@ struct PoeTextView: NSViewRepresentable {
                 textView.window?.makeFirstResponder(textView)
             }
         }
+
+        context.coordinator.updateFind(in: textView, to: find)
     }
 
     final class Coordinator: NSObject, NSTextViewDelegate {
@@ -136,6 +159,8 @@ struct PoeTextView: NSViewRepresentable {
         /// Where the caret was in each document, so coming back feels like
         /// returning rather than starting over.
         private var carets: [UUID: Int] = [:]
+        /// What was last drawn, so an update that changes nothing costs nothing.
+        private var findState = FindState()
 
         static func paragraphStyle(dense: Bool) -> NSParagraphStyle {
             let style = NSMutableParagraphStyle()
@@ -181,6 +206,7 @@ struct PoeTextView: NSViewRepresentable {
             textView.defaultParagraphStyle = Self.paragraphStyle(dense: parent.dense)
             styledRange = nil
             restyleVisible(textView, force: true)
+            highlightFind(in: textView)
         }
 
         /// Style what's on screen, plus a margin either side so scrolling never
@@ -191,6 +217,7 @@ struct PoeTextView: NSViewRepresentable {
             if !force, let styled = styledRange, NSIntersectionRange(styled, target) == target { return }
             MarkdownStyle.apply(to: storage, base: Self.attributes(dense: parent.dense), in: target)
             styledRange = target
+            highlightFind(in: textView)
         }
 
         /// Just the paragraph under the caret — what a keystroke can change on
@@ -203,6 +230,7 @@ struct PoeTextView: NSViewRepresentable {
             MarkdownStyle.apply(to: storage, base: Self.attributes(dense: parent.dense), in: paragraph)
             // Everything after the edit has shifted; the old range no longer maps.
             styledRange = nil
+            highlightFind(in: textView)
         }
 
         /// Multi-line markdown — a fence opening three lines up — only settles
@@ -233,6 +261,9 @@ struct PoeTextView: NSViewRepresentable {
         @objc private func didScroll() {
             guard let textView = scrollView?.documentView as? NSTextView else { return }
             restyleVisible(textView, force: false)
+            // Not part of the restyle: code and very long documents never reach
+            // it, and their matches still have to light up as they scroll in.
+            highlightFind(in: textView)
         }
 
         private func visibleRange(of textView: NSTextView) -> NSRange {
@@ -251,12 +282,77 @@ struct PoeTextView: NSViewRepresentable {
             return NSRange(location: start, length: end - start)
         }
 
+        /// Esc closes the find bar from the editor too, the way it does from the
+        /// field itself — the writer shouldn't have to reach back for it.
+        func textView(_ textView: NSTextView, doCommandBy selector: Selector) -> Bool {
+            guard selector == #selector(NSResponder.cancelOperation(_:)) else { return false }
+            return parent.onEscape()
+        }
+
         func textDidChange(_ notification: Notification) {
             guard let textView = notification.object as? NSTextView else { return }
             parent.onEdit(textView.string)
             restyleCaretParagraph(in: textView)
             scheduleRestyle(of: textView)
         }
+
+        // MARK: - Find
+
+        /// Draw the search the store handed us: light every match on screen,
+        /// and scroll to the current one when it has actually moved.
+        func updateFind(in textView: NSTextView, to state: FindState) {
+            let previous = findState
+            guard state != previous else { return }
+            findState = state
+
+            if state.active, state.revealToken != previous.revealToken {
+                reveal(in: textView)
+            }
+            highlightFind(in: textView)
+        }
+
+        /// Scroll a match into view and leave the caret on it, so dismissing the
+        /// bar puts you exactly where you were looking.
+        private func reveal(in textView: NSTextView) {
+            guard let range = findState.currentRange,
+                  NSMaxRange(range) <= (textView.string as NSString).length else { return }
+            textView.setSelectedRange(NSRange(location: range.location, length: 0))
+            textView.scrollRangeToVisible(range)
+            restyleVisible(textView, force: false)
+        }
+
+        /// Matches are lit with temporary attributes: the buffer itself is never
+        /// touched, so nothing here can reach the file on disk or the undo stack.
+        /// Only what's on screen is lit — a match in a 2 MB file costs nothing
+        /// until you scroll to it.
+        private func highlightFind(in textView: NSTextView) {
+            guard let layoutManager = textView.layoutManager else { return }
+            let whole = NSRange(location: 0, length: (textView.string as NSString).length)
+            layoutManager.removeTemporaryAttribute(.backgroundColor, forCharacterRange: whole)
+            layoutManager.removeTemporaryAttribute(.foregroundColor, forCharacterRange: whole)
+            guard findState.active, !findState.matches.isEmpty else { return }
+
+            let onScreen = visibleRange(of: textView)
+            for (index, range) in findState.matches.map(\.range).enumerated() {
+                guard NSMaxRange(range) <= whole.length else { continue }
+                let current = index + 1 == findState.current
+                guard current || NSIntersectionRange(range, onScreen).length > 0 else { continue }
+                layoutManager.addTemporaryAttributes(
+                    current ? Self.currentMatch : Self.otherMatch,
+                    forCharacterRange: range
+                )
+            }
+        }
+
+        private static let currentMatch: [NSAttributedString.Key: Any] = [
+            .backgroundColor: NSColor(Theme.accent).withAlphaComponent(0.85),
+            .foregroundColor: NSColor(Theme.void)
+        ]
+
+        private static let otherMatch: [NSAttributedString.Key: Any] = [
+            .backgroundColor: NSColor(Theme.accent).withAlphaComponent(0.20),
+            .foregroundColor: NSColor(Theme.ink)
+        ]
 
         deinit {
             NotificationCenter.default.removeObserver(self)
@@ -265,3 +361,35 @@ struct PoeTextView: NSViewRepresentable {
 }
 
 
+
+
+/// The editor's text view, wherever it currently is in the window.
+///
+/// ⌘E is a menu command, and menu commands live outside every view — so the one
+/// thing it needs, the writer's selection, has to be fetched from the responder
+/// tree by hand.
+enum EditorTextView {
+    static var current: NSTextView? {
+        for window in NSApp.windows where window.isVisible {
+            if let root = window.contentView, let found = search(root) { return found }
+        }
+        return nil
+    }
+
+    static var selectedText: String? {
+        guard let textView = current else { return nil }
+        let range = textView.selectedRange()
+        guard range.length > 0 else { return nil }
+        return (textView.string as NSString).substring(with: range)
+    }
+
+    private static func search(_ view: NSView) -> NSTextView? {
+        if let textView = view as? NSTextView, textView.identifier == PoeTextView.identifier {
+            return textView
+        }
+        for subview in view.subviews {
+            if let found = search(subview) { return found }
+        }
+        return nil
+    }
+}
