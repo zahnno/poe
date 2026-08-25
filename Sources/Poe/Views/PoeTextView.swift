@@ -8,11 +8,26 @@ import AppKit
 struct PoeTextView: NSViewRepresentable {
     static let identifier = NSUserInterfaceItemIdentifier("poe.editor")
 
-    @Binding var text: String
+    /// The text is passed by value, not as a `@Binding`, and deliberately so:
+    /// SwiftUI diffs a representable on its stored properties, and a binding's
+    /// *contents* are invisible to that comparison. With a binding, text that
+    /// changed anywhere but in this view — a reload from disk, a file edited in
+    /// another app — never reached the buffer until some unrelated redraw
+    /// happened to come along.
+    var text: String
+    /// Called with the new text whenever the writer types.
+    var onEdit: (String) -> Void
+    /// Which note or file the buffer currently holds. One text view serves every
+    /// document, so this is what tells it a *different* document arrived.
+    var documentID: UUID?
     var focusToken: Int
     /// False while the markdown preview is up: the view stays mounted (so undo
     /// history and scroll position survive) but must not hold the keyboard.
     var active: Bool = true
+    /// Prose gets red squiggles; a JSON file does not.
+    var spellChecks: Bool = true
+    /// Code wants its lines close together; prose wants room to breathe.
+    var dense: Bool = false
 
     func makeCoordinator() -> Coordinator { Coordinator(self) }
 
@@ -38,15 +53,20 @@ struct PoeTextView: NSViewRepresentable {
         textView.insertionPointColor = NSColor(Theme.accent)
         textView.textColor = NSColor(Theme.ink)
         textView.font = Theme.editorFont
-        textView.defaultParagraphStyle = Coordinator.paragraphStyle
-        textView.typingAttributes = Coordinator.attributes
 
-        // Prose tools that fight with markdown and code.
+        // Prose tools that fight with markdown and code. Autocorrection is off
+        // for a second reason: it rewrites text *asynchronously*, and a
+        // correction queued against one document used to land in the next one —
+        // which, now that documents can be files, means edits to someone's disk.
         textView.isAutomaticQuoteSubstitutionEnabled = false
         textView.isAutomaticDashSubstitutionEnabled = false
         textView.isAutomaticTextReplacementEnabled = false
-        textView.isContinuousSpellCheckingEnabled = true
+        textView.isAutomaticSpellingCorrectionEnabled = false
+        textView.isAutomaticTextCompletionEnabled = false
+        textView.isAutomaticDataDetectionEnabled = false
+        textView.isAutomaticLinkDetectionEnabled = false
         textView.isGrammarCheckingEnabled = false
+        textView.isContinuousSpellCheckingEnabled = spellChecks
         textView.usesFindBar = true
         textView.isIncrementalSearchingEnabled = true
 
@@ -58,9 +78,22 @@ struct PoeTextView: NSViewRepresentable {
         guard let textView = scrollView.documentView as? NSTextView else { return }
         context.coordinator.parent = self
 
-        // Only rewrite the buffer when the model genuinely diverged (a note switch,
-        // not the keystroke we just reported) — otherwise the caret jumps to the end.
-        if textView.string != text {
+        textView.isContinuousSpellCheckingEnabled = spellChecks
+
+        if context.coordinator.documentID != documentID {
+            // A different document. The text view is shared, so everything it was
+            // holding for the last one — half-typed input, an undo stack that
+            // would splice the old words into this file — has to go with it.
+            context.coordinator.rememberCaret(in: textView)
+            context.coordinator.documentID = documentID
+            textView.inputContext?.discardMarkedText()
+            textView.string = text
+            context.coordinator.apply(to: textView)
+            textView.undoManager?.removeAllActions()
+            context.coordinator.restoreCaret(in: textView)
+        } else if textView.string != text {
+            // Same document, new text: a reload from disk, or a change made
+            // outside Poe. Keep the caret where the writer left it.
             let selected = textView.selectedRange()
             textView.string = text
             context.coordinator.apply(to: textView)
@@ -84,37 +117,57 @@ struct PoeTextView: NSViewRepresentable {
     final class Coordinator: NSObject, NSTextViewDelegate {
         var parent: PoeTextView
         var focusToken: Int
+        var documentID: UUID?
+        /// Where the caret was in each document, so coming back feels like
+        /// returning rather than starting over.
+        private var carets: [UUID: Int] = [:]
 
-        static let paragraphStyle: NSParagraphStyle = {
+        static func paragraphStyle(dense: Bool) -> NSParagraphStyle {
             let style = NSMutableParagraphStyle()
-            style.lineSpacing = 7
-            style.paragraphSpacing = 10
+            style.lineSpacing = dense ? 2.5 : 7
+            style.paragraphSpacing = dense ? 0 : 10
             return style
-        }()
+        }
 
-        static let attributes: [NSAttributedString.Key: Any] = [
-            .font: Theme.editorFont,
-            .foregroundColor: NSColor(Theme.ink),
-            .paragraphStyle: paragraphStyle
-        ]
+        static func attributes(dense: Bool) -> [NSAttributedString.Key: Any] {
+            [
+                .font: Theme.editorFont,
+                .foregroundColor: NSColor(Theme.ink),
+                .paragraphStyle: paragraphStyle(dense: dense)
+            ]
+        }
 
         init(_ parent: PoeTextView) {
             self.parent = parent
             self.focusToken = parent.focusToken
         }
 
+        func rememberCaret(in textView: NSTextView) {
+            guard let documentID else { return }
+            carets[documentID] = textView.selectedRange().location
+        }
+
+        func restoreCaret(in textView: NSTextView) {
+            let limit = (textView.string as NSString).length
+            let location = min(documentID.flatMap { carets[$0] } ?? 0, limit)
+            let range = NSRange(location: location, length: 0)
+            textView.setSelectedRange(range)
+            textView.scrollRangeToVisible(range)
+        }
+
         /// Re-stamp font, colour and spacing across the buffer after a wholesale
         /// text replacement, which drops attributes on the floor.
         func apply(to textView: NSTextView) {
             guard let storage = textView.textStorage else { return }
-            let full = NSRange(location: 0, length: storage.length)
-            storage.setAttributes(Self.attributes, range: full)
-            textView.typingAttributes = Self.attributes
+            let attributes = Self.attributes(dense: parent.dense)
+            storage.setAttributes(attributes, range: NSRange(location: 0, length: storage.length))
+            textView.typingAttributes = attributes
+            textView.defaultParagraphStyle = Self.paragraphStyle(dense: parent.dense)
         }
 
         func textDidChange(_ notification: Notification) {
             guard let textView = notification.object as? NSTextView else { return }
-            parent.text = textView.string
+            parent.onEdit(textView.string)
         }
     }
 }

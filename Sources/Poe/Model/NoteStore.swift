@@ -1,12 +1,17 @@
+import AppKit
 import Foundation
 import SwiftUI
-import AppKit
+import UniformTypeIdentifiers
 
 /// Owns every note, persists them to disk, and drives the UI.
 ///
 /// Notes live in a single JSON document under Application Support. Writes are
 /// debounced so a fast typist never touches the disk more than once per second,
 /// and are atomic so a crash mid-save can never truncate the library.
+///
+/// A note may additionally be *linked* to a file the user opened. Linked notes
+/// still live in the library — so they are searchable and survive a relaunch —
+/// but every save also writes the text straight back to the original file.
 @MainActor
 final class NoteStore: ObservableObject {
 
@@ -16,8 +21,14 @@ final class NoteStore: ObservableObject {
     static let shared = NoteStore()
 
     @Published var notes: [Note] = []
-    @Published var selection: UUID?
     @Published var query: String = ""
+
+    @Published var selection: UUID? {
+        didSet {
+            // A code or data file has no markdown to preview.
+            if previewing, !(selectedNote?.kind.rendersMarkdown ?? true) { previewing = false }
+        }
+    }
 
     @Published var sidebarVisible: Bool = true
     @Published var previewing: Bool = false
@@ -25,7 +36,20 @@ final class NoteStore: ObservableObject {
     @Published var searchFocusToken: Int = 0
     @Published var editorFocusToken: Int = 0
 
+    /// Linked notes whose file has moved, been deleted, or refused a write.
+    @Published var brokenLinks: Set<UUID> = []
+    @Published var message: PoeMessage?
+
+    /// What we last wrote to each linked file, so a save that changes nothing
+    /// doesn't touch the file's modification date.
+    private var lastWritten: [UUID: String] = [:]
     private var saveTask: Task<Void, Never>?
+
+    struct PoeMessage: Identifiable {
+        let id = UUID()
+        var title: String
+        var body: String
+    }
 
     // MARK: - Location
 
@@ -41,6 +65,8 @@ final class NoteStore: ObservableObject {
 
     private init() {
         load()
+        // Adopt anything that changed on disk before deciding what is "current".
+        syncLinkedFiles()
         if notes.isEmpty {
             notes = [Note(text: Self.welcomeText)]
             scheduleSave()
@@ -66,6 +92,8 @@ final class NoteStore: ObservableObject {
     }
 
     func saveNow() {
+        writeLinkedFiles()
+
         let snapshot = notes
         let encoder = JSONEncoder()
         encoder.dateEncodingStrategy = .iso8601
@@ -99,6 +127,10 @@ final class NoteStore: ObservableObject {
         return notes.firstIndex { $0.id == selection }
     }
 
+    var canPreview: Bool {
+        selectedNote?.kind.rendersMarkdown ?? false
+    }
+
     /// Two-way binding onto the selected note's text, with save + timestamp bookkeeping.
     var currentText: Binding<String> {
         Binding(
@@ -112,11 +144,160 @@ final class NoteStore: ObservableObject {
         )
     }
 
+    // MARK: - Opening files
+
+    /// Ask for files and open them. Nothing is filtered out up front: an
+    /// extension-less config file is as openable as a `.md`, and anything that
+    /// turns out to be binary is refused with a reason once we look inside.
+    func openFromPanel() {
+        let panel = NSOpenPanel()
+        panel.allowsMultipleSelection = true
+        panel.canChooseFiles = true
+        panel.canChooseDirectories = false
+        panel.treatsFilePackagesAsDirectories = false
+        panel.message = "Open a text file — Markdown, plain text, code, or data."
+        panel.prompt = "Open"
+        if panel.runModal() == .OK { open(panel.urls) }
+    }
+
+    /// Open files from anywhere: the panel, Finder, a drop on the window, or
+    /// `open -a Poe notes.md` in a terminal.
+    func open(_ urls: [URL]) {
+        var lastOpened: UUID?
+        var failures: [String] = []
+
+        for url in urls {
+            do {
+                let loaded = try TextFile.read(url)
+                lastOpened = adopt(loaded)
+            } catch {
+                failures.append(error.localizedDescription)
+            }
+        }
+
+        if let lastOpened {
+            query = ""
+            selection = lastOpened
+            previewing = false
+            focusEditor()
+            scheduleSave()
+            NSApp.activate(ignoringOtherApps: true)
+        }
+
+        if !failures.isEmpty {
+            message = PoeMessage(
+                title: failures.count == 1 ? "Couldn’t open that file" : "Couldn’t open \(failures.count) files",
+                body: failures.joined(separator: "\n\n")
+            )
+        }
+    }
+
+    /// Fold a freshly read file into the library, reusing the note that already
+    /// tracks that path so opening the same file twice doesn't clone it.
+    private func adopt(_ loaded: TextFile.Loaded) -> UUID {
+        if let index = notes.firstIndex(where: { $0.file?.path == loaded.link.path }) {
+            // The file on disk is the truth at the moment it is opened.
+            if notes[index].text != loaded.text {
+                notes[index].text = loaded.text
+                notes[index].updated = loaded.modified
+            }
+            notes[index].file = loaded.link
+            lastWritten[notes[index].id] = loaded.text
+            brokenLinks.remove(notes[index].id)
+            return notes[index].id
+        }
+
+        let note = Note(
+            text: loaded.text,
+            created: loaded.created,
+            updated: loaded.modified,
+            file: loaded.link
+        )
+        notes.append(note)
+        lastWritten[note.id] = loaded.text
+        return note.id
+    }
+
+    // MARK: - Keeping files in step
+
+    /// Push every linked note back to its file. Called on each save.
+    private func writeLinkedFiles() {
+        for note in notes {
+            guard let link = note.file, lastWritten[note.id] != note.text else { continue }
+            do {
+                try TextFile.write(note.text, to: link)
+                lastWritten[note.id] = note.text
+                brokenLinks.remove(note.id)
+            } catch {
+                brokenLinks.insert(note.id)
+            }
+        }
+    }
+
+    /// Pull in changes made outside Poe.
+    ///
+    /// The file wins only when it is genuinely newer than the note — otherwise
+    /// keystrokes that haven't been flushed yet would lose to the older copy on
+    /// disk. Run at launch and whenever the app comes back to the front.
+    func syncLinkedFiles() {
+        for index in notes.indices {
+            guard let link = notes[index].file else { continue }
+            let id = notes[index].id
+
+            guard TextFile.exists(link) else {
+                brokenLinks.insert(id)
+                continue
+            }
+            brokenLinks.remove(id)
+
+            guard let loaded = try? TextFile.read(link.url) else { continue }
+            if loaded.text == notes[index].text {
+                lastWritten[id] = loaded.text
+            } else if loaded.modified > notes[index].updated {
+                notes[index].text = loaded.text
+                notes[index].file = loaded.link
+                notes[index].updated = loaded.modified
+                lastWritten[id] = loaded.text
+            }
+        }
+    }
+
+    /// Discard local edits and take whatever the file says now.
+    func reloadSelectedFromDisk() {
+        guard let index = selectedIndex, let link = notes[index].file else { return }
+        do {
+            let loaded = try TextFile.read(link.url)
+            notes[index].text = loaded.text
+            notes[index].file = loaded.link
+            notes[index].updated = loaded.modified
+            lastWritten[notes[index].id] = loaded.text
+            brokenLinks.remove(notes[index].id)
+            scheduleSave()
+        } catch {
+            message = PoeMessage(title: "Couldn’t reload", body: error.localizedDescription)
+        }
+    }
+
+    /// Keep the text, drop the tether — the file on disk stops changing.
+    func unlinkSelected() {
+        guard let index = selectedIndex, notes[index].file != nil else { return }
+        lastWritten[notes[index].id] = nil
+        brokenLinks.remove(notes[index].id)
+        notes[index].file = nil
+        notes[index].updated = Date()
+        scheduleSave()
+    }
+
+    func revealSelectedInFinder() {
+        guard let link = selectedNote?.file else { return }
+        NSWorkspace.shared.activateFileViewerSelecting([link.url])
+    }
+
     // MARK: - Commands
 
     func newNote() {
         // Reuse a blank note rather than littering the library with empties.
-        if let blank = sorted.first(where: { $0.isEmpty && !$0.pinned }) {
+        if let blank = sorted.first(where: { $0.isEmpty && !$0.pinned && $0.file == nil }) {
             selection = blank.id
         } else {
             let note = Note()
@@ -135,6 +316,8 @@ final class NoteStore: ObservableObject {
         let neighbours = visible
         let position = neighbours.firstIndex { $0.id == id }
         notes.remove(at: index)
+        lastWritten[id] = nil
+        brokenLinks.remove(id)
         if wasSelected {
             let remaining = visible
             if let position, !remaining.isEmpty {
@@ -152,9 +335,10 @@ final class NoteStore: ObservableObject {
         requestDelete(note)
     }
 
-    /// Empty notes go quietly; anything with words in it asks first.
+    /// Empty notes go quietly; anything with words in it — or a file behind it —
+    /// asks first.
     func requestDelete(_ note: Note) {
-        if note.isEmpty {
+        if note.isEmpty, note.file == nil {
             delete(note.id)
         } else {
             pendingDelete = note
@@ -178,11 +362,10 @@ final class NoteStore: ObservableObject {
         togglePin(selection)
     }
 
+    /// A duplicate is a note, never a second writer on the same file.
     func duplicateSelected() {
         guard let note = selectedNote else { return }
-        var copy = Note(text: note.text)
-        copy.created = Date()
-        copy.updated = Date()
+        let copy = Note(text: note.text)
         notes.append(copy)
         selection = copy.id
         scheduleSave()
@@ -199,6 +382,13 @@ final class NoteStore: ObservableObject {
         selection = list[next].id
     }
 
+    /// Menu commands are built outside any view, so they can't see whether the
+    /// current document has markdown in it — the guard lives here instead.
+    func togglePreview() {
+        guard canPreview || previewing else { return }
+        previewing.toggle()
+    }
+
     func focusSearch() {
         sidebarVisible = true
         searchFocusToken &+= 1
@@ -208,14 +398,39 @@ final class NoteStore: ObservableObject {
         editorFocusToken &+= 1
     }
 
-    func exportSelected() {
-        guard let note = selectedNote else { return }
+    /// Write the note out to a file of the user's choosing — and keep writing
+    /// there from then on, the way Save As has always behaved.
+    func saveSelectedAs() {
+        guard let index = selectedIndex else { return }
+        let note = notes[index]
+
         let panel = NSSavePanel()
-        panel.nameFieldStringValue = sanitize(note.title) + ".md"
-        panel.allowedContentTypes = [.plainText]
+        panel.nameFieldStringValue = note.file?.name ?? sanitize(note.title) + ".md"
         panel.canCreateDirectories = true
-        if panel.runModal() == .OK, let url = panel.url {
-            try? note.text.write(to: url, atomically: true, encoding: .utf8)
+        panel.allowsOtherFileTypes = true
+        panel.isExtensionHidden = false
+        // Offer the type it already has, or Markdown for a note. An extension the
+        // system doesn't recognise gets no filter at all rather than a wrong one.
+        if let file = note.file {
+            if let type = UTType(filenameExtension: file.url.pathExtension) {
+                panel.allowedContentTypes = [type]
+            }
+        } else {
+            panel.allowedContentTypes = [UTType(filenameExtension: "md") ?? .plainText]
+        }
+
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+
+        var link = note.file ?? FileLink(path: url.path)
+        link.path = url.standardizedFileURL.path
+        do {
+            try TextFile.write(note.text, to: link)
+            notes[index].file = link
+            lastWritten[notes[index].id] = notes[index].text
+            brokenLinks.remove(notes[index].id)
+            scheduleSave()
+        } catch {
+            message = PoeMessage(title: "Couldn’t save", body: error.localizedDescription)
         }
     }
 
@@ -240,13 +455,18 @@ final class NoteStore: ObservableObject {
 
     ## Shortcuts
     - Cmd N — new note
+    - Cmd O — open a file (.md, .txt, code, anything text)
     - Cmd F — search every note
     - Cmd P — preview markdown
     - Cmd D — pin the current note
     - Cmd 0 — hide the sidebar for focus mode
-    - Cmd Backspace — delete the current note
+    - Cmd Backspace — remove the current note
 
     Markdown works: **bold**, *italic*, `code`, and [links](https://example.com).
+
+    Open a file and Poe edits it in place — every keystroke goes straight back to
+    the file on disk, in its own encoding and line endings. Drag one onto the
+    window to try it.
 
     Delete this note whenever you're ready to begin.
     """

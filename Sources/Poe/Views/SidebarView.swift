@@ -131,13 +131,26 @@ struct SidebarView: View {
                         .font(.system(size: 9))
                         .foregroundStyle(Theme.accent)
                         .padding(.top, 3)
+                } else if store.brokenLinks.contains(note.id) {
+                    Image(systemName: "exclamationmark.triangle.fill")
+                        .font(.system(size: 9))
+                        .foregroundStyle(Theme.rose)
+                        .padding(.top, 3)
+                        .help("The file behind this note is missing")
                 }
 
                 VStack(alignment: .leading, spacing: 3) {
-                    Text(note.title)
-                        .font(.system(size: 13, weight: selected ? .semibold : .medium, design: .rounded))
-                        .foregroundStyle(selected ? Theme.ink : Theme.ink.opacity(0.85))
-                        .lineLimit(1)
+                    HStack(spacing: 6) {
+                        Text(note.title)
+                            .font(.system(size: 13, weight: selected ? .semibold : .medium, design: .rounded))
+                            .foregroundStyle(selected ? Theme.ink : Theme.ink.opacity(0.85))
+                            .lineLimit(1)
+                            .truncationMode(.middle)
+
+                        if note.file != nil {
+                            KindBadge(text: note.badge, linked: true)
+                        }
+                    }
 
                     Text(note.snippet)
                         .font(.system(size: 11.5))
@@ -182,7 +195,7 @@ struct SidebarView: View {
         .animation(.spring(response: 0.32, dampingFraction: 0.82), value: store.selection)
         .contextMenu {
             Button(note.pinned ? "Unpin" : "Pin") { store.togglePin(note.id) }
-            Button("Duplicate") {
+            Button("Duplicate as Note") {
                 store.selection = note.id
                 store.duplicateSelected()
             }
@@ -190,40 +203,76 @@ struct SidebarView: View {
                 store.selection = note.id
                 store.copySelectedToPasteboard()
             }
-            Button("Export as Markdown…") {
+            Button("Save As…") {
                 store.selection = note.id
-                store.exportSelected()
+                store.saveSelectedAs()
+            }
+            if note.file != nil {
+                Divider()
+                Button("Reveal File in Finder") {
+                    store.selection = note.id
+                    store.revealSelectedInFinder()
+                }
+                Button("Reload from Disk") {
+                    store.selection = note.id
+                    store.reloadSelectedFromDisk()
+                }
+                Button("Stop Editing File") {
+                    store.selection = note.id
+                    store.unlinkSelected()
+                }
             }
             Divider()
-            Button("Delete", role: .destructive) { store.requestDelete(note) }
+            Button(note.file == nil ? "Delete" : "Remove from Poe", role: .destructive) {
+                store.requestDelete(note)
+            }
         }
     }
 
     // MARK: - Footer
 
     private var newNoteButton: some View {
-        Button { store.newNote() } label: {
-            HStack(spacing: 7) {
-                Image(systemName: "plus")
-                    .font(.system(size: 11, weight: .bold))
-                Text("New note")
-                    .font(.system(size: 12.5, weight: .semibold, design: .rounded))
-                Spacer()
-                Text("⌘N")
-                    .font(.system(size: 10.5, weight: .medium, design: .rounded))
-                    .foregroundStyle(Theme.void.opacity(0.55))
+        HStack(spacing: 8) {
+            Button { store.newNote() } label: {
+                HStack(spacing: 7) {
+                    Image(systemName: "plus")
+                        .font(.system(size: 11, weight: .bold))
+                    Text("New note")
+                        .font(.system(size: 12.5, weight: .semibold, design: .rounded))
+                    Spacer()
+                    Text("⌘N")
+                        .font(.system(size: 10.5, weight: .medium, design: .rounded))
+                        .foregroundStyle(Theme.void.opacity(0.55))
+                }
+                .foregroundStyle(Theme.void)
+                .padding(.horizontal, 12)
+                .padding(.vertical, 9)
+                .frame(maxWidth: .infinity)
+                .background(
+                    RoundedRectangle(cornerRadius: 10, style: .continuous)
+                        .fill(Theme.glow)
+                )
+                .shadow(color: Theme.accent.opacity(0.28), radius: 12, y: 4)
             }
-            .foregroundStyle(Theme.void)
-            .padding(.horizontal, 12)
-            .padding(.vertical, 9)
-            .frame(maxWidth: .infinity)
-            .background(
-                RoundedRectangle(cornerRadius: 10, style: .continuous)
-                    .fill(Theme.glow)
-            )
-            .shadow(color: Theme.accent.opacity(0.28), radius: 12, y: 4)
+            .buttonStyle(PressableButtonStyle())
+
+            Button { store.openFromPanel() } label: {
+                Image(systemName: "folder")
+                    .font(.system(size: 12, weight: .medium))
+                    .foregroundStyle(Theme.inkDim)
+                    .frame(width: 34, height: 34)
+                    .background(
+                        RoundedRectangle(cornerRadius: 10, style: .continuous)
+                            .fill(Color.white.opacity(0.05))
+                    )
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 10, style: .continuous)
+                            .strokeBorder(Theme.panelStroke, lineWidth: 1)
+                    )
+            }
+            .buttonStyle(PressableButtonStyle())
+            .help("Open a file (⌘O)")
         }
-        .buttonStyle(PressableButtonStyle())
         .padding(.horizontal, 14)
         .padding(.bottom, 14)
     }
