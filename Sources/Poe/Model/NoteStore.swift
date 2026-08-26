@@ -32,7 +32,21 @@ final class NoteStore: ObservableObject {
     /// own uninitialised copy and every shortcut would silently do nothing.
     static let shared = NoteStore()
 
-    @Published var notes: [Note] = []
+    /// Every note.
+    ///
+    /// Deliberately *not* `@Published`. A keystroke changes one note's text,
+    /// and republishing the array on every one of them re-rendered the sidebar,
+    /// the toolbar and the status bar — sorting the library, re-reading every
+    /// note's first line, rebuilding forty rows — for a change none of them
+    /// could show yet. Structural changes call `libraryChanged()`; typing calls
+    /// `libraryWillSettle()`, and the chrome catches up a few times a second.
+    private(set) var notes: [Note] = []
+
+    /// Bumped whenever the library changes in a way the UI can see. Views
+    /// observe the store as a whole, so this is what invalidates them — and
+    /// what the derived values below are cached against.
+    @Published private(set) var libraryVersion: Int = 0
+
     @Published var query: String = ""
 
     @Published var selection: UUID? {
@@ -104,6 +118,14 @@ final class NoteStore: ObservableObject {
     /// doesn't touch the file's modification date.
     private var lastWritten: [UUID: String] = [:]
     private var saveTask: Task<Void, Never>?
+    private var settleTask: Task<Void, Never>?
+
+    /// The sifted, sorted library, and the counts under the editor. Both are
+    /// derived from every note's text, and both used to be recomputed several
+    /// times per redraw — `visible` twice in one pass of the sidebar's body.
+    /// They are answered once per version instead.
+    private var cachedVisible: (version: Int, query: String, notes: [Note])?
+    private var cachedStats: (version: Int, id: UUID?, stats: Stats)?
 
     struct PoeMessage: Identifiable {
         let id = UUID()
@@ -111,9 +133,32 @@ final class NoteStore: ObservableObject {
         var body: String
     }
 
+    // MARK: - Invalidation
+
+    /// The library changed in a way the UI has to show now.
+    func libraryChanged() {
+        settleTask?.cancel()
+        settleTask = nil
+        libraryVersion &+= 1
+    }
+
+    /// The library changed under the writer's fingers. The sidebar's snippet
+    /// and the word count are worth keeping current, but not at the price of
+    /// rebuilding them between two keystrokes — this lets them catch up a few
+    /// times a second while the typing carries on undisturbed.
+    private func libraryWillSettle() {
+        guard settleTask == nil else { return }
+        settleTask = Task { [weak self] in
+            try? await Task.sleep(nanoseconds: 300_000_000)
+            guard !Task.isCancelled else { return }
+            self?.settleTask = nil
+            self?.libraryVersion &+= 1
+        }
+    }
+
     // MARK: - Location
 
-    static let directory: URL = {
+    nonisolated static let directory: URL = {
         // The self test points this somewhere disposable: a harness that types
         // into notes must never be pointed at the real ones.
         if let scratch = ProcessInfo.processInfo.environment["POE_LIBRARY"], !scratch.isEmpty {
@@ -124,18 +169,19 @@ final class NoteStore: ObservableObject {
         return base.appendingPathComponent("Poe", isDirectory: true)
     }()
 
-    private static var fileURL: URL { directory.appendingPathComponent("notes.json") }
+    nonisolated static var fileURL: URL { directory.appendingPathComponent("notes.json") }
 
     // MARK: - Lifecycle
 
     private init() {
         load()
         // Adopt anything that changed on disk before deciding what is "current".
-        syncLinkedFiles()
+        syncLinkedFilesNow()
         if notes.isEmpty {
             notes = [Note(text: Self.welcomeText)]
             scheduleSave()
         }
+        libraryChanged()
         selection = sorted.first?.id
     }
 
@@ -144,6 +190,7 @@ final class NoteStore: ObservableObject {
         let decoder = JSONDecoder()
         decoder.dateDecodingStrategy = .iso8601
         notes = (try? decoder.decode([Note].self, from: data)) ?? []
+        libraryChanged()
     }
 
     /// Coalesces rapid edits into a single write.
@@ -156,17 +203,99 @@ final class NoteStore: ObservableObject {
         }
     }
 
+    /// Write everything out — the library, and every linked note's file.
+    ///
+    /// Encoding a library and pushing it to disk used to happen on the main
+    /// actor, which meant the caret stopped for as long as the write took, a
+    /// second after every pause in the typing. The snapshot is taken here; the
+    /// disk work happens on `writer`, an actor, so saves also can't overlap
+    /// each other. Only a quit waits for it.
     func saveNow() {
-        writeLinkedFiles()
-
+        let pending = pendingLinkedWrites()
         let snapshot = notes
-        let encoder = JSONEncoder()
-        encoder.dateEncodingStrategy = .iso8601
-        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
-        guard let data = try? encoder.encode(snapshot) else { return }
-        try? FileManager.default.createDirectory(at: Self.directory, withIntermediateDirectories: true)
-        try? data.write(to: Self.fileURL, options: .atomic)
+        let writer = Self.writer
+        Task { [weak self] in
+            let failed = await writer.save(snapshot, linked: pending)
+            self?.linkedWrites(finished: pending, failed: failed)
+        }
     }
+
+    /// The blocking version, for the one moment it matters: the app is going
+    /// away and an unfinished write would go with it. Done right here, on
+    /// whichever thread is quitting, rather than handed to anything that might
+    /// not be scheduled again.
+    func saveAndWait() {
+        saveTask?.cancel()
+        saveTask = nil
+        let pending = pendingLinkedWrites()
+        let failed = Writer.perform(notes, linked: pending)
+        // Same book-keeping the async path does — a file that has just been
+        // written is no longer a broken link, whichever way the write got there.
+        linkedWrites(finished: pending, failed: failed)
+    }
+
+    /// Which linked notes have text their file hasn't been given yet.
+    private func pendingLinkedWrites() -> [LinkedWrite] {
+        notes.compactMap { note in
+            guard let link = note.file, lastWritten[note.id] != note.text else { return nil }
+            return LinkedWrite(id: note.id, link: link, text: note.text)
+        }
+    }
+
+    /// Book-keeping for writes that have landed, back on the main actor.
+    private func linkedWrites(finished: [LinkedWrite], failed: Set<UUID>) {
+        for write in finished {
+            if failed.contains(write.id) {
+                brokenLinks.insert(write.id)
+            } else {
+                lastWritten[write.id] = write.text
+                brokenLinks.remove(write.id)
+            }
+        }
+    }
+
+    struct LinkedWrite: Sendable {
+        var id: UUID
+        var link: FileLink
+        var text: String
+    }
+
+    /// Everything that touches the disk, serialized and off the main thread.
+    private actor Writer {
+        func save(_ snapshot: [Note], linked: [LinkedWrite]) -> Set<UUID> {
+            Self.perform(snapshot, linked: linked)
+        }
+
+        nonisolated static func perform(_ snapshot: [Note], linked: [LinkedWrite]) -> Set<UUID> {
+            var failed: Set<UUID> = []
+            for write in linked {
+                do { try TextFile.write(write.text, to: write.link) } catch { failed.insert(write.id) }
+            }
+
+            let encoder = JSONEncoder()
+            encoder.dateEncodingStrategy = .iso8601
+            // Sorted keys keep the file diffable; pretty-printing only made it
+            // bigger and slower to write, and nobody reads it by hand.
+            encoder.outputFormatting = [.sortedKeys]
+            guard let data = try? encoder.encode(snapshot) else { return failed }
+            try? FileManager.default.createDirectory(at: NoteStore.directory, withIntermediateDirectories: true)
+            try? data.write(to: NoteStore.fileURL, options: .atomic)
+            return failed
+        }
+
+        /// Read every linked file, so the main actor can decide what to adopt
+        /// without blocking on the disk to find out.
+        func reread(_ links: [(id: UUID, link: FileLink)]) -> [UUID: TextFile.Loaded?] {
+            var result: [UUID: TextFile.Loaded?] = [:]
+            for (id, link) in links {
+                guard TextFile.exists(link) else { continue }
+                result[id] = try? TextFile.read(link.url)
+            }
+            return result
+        }
+    }
+
+    private static let writer = Writer()
 
     // MARK: - Derived state
 
@@ -178,8 +307,39 @@ final class NoteStore: ObservableObject {
         }
     }
 
+    /// What the sidebar lists. Answered from the cache until the library or the
+    /// search changes: the filter reads every note's full text, and the sidebar
+    /// asks for this more than once per pass.
     var visible: [Note] {
-        sorted.filter { $0.matches(query) }
+        if let cached = cachedVisible, cached.version == libraryVersion, cached.query == query {
+            return cached.notes
+        }
+        let notes = sorted.filter { $0.matches(query) }
+        cachedVisible = (libraryVersion, query, notes)
+        return notes
+    }
+
+    /// Words, characters and lines under the editor — three passes over the
+    /// whole document, so they are counted once per settled change rather than
+    /// once per redraw.
+    struct Stats: Equatable {
+        var words = 0
+        var characters = 0
+        var lines = 0
+    }
+
+    var stats: Stats {
+        if let cached = cachedStats, cached.version == libraryVersion, cached.id == selection {
+            return cached.stats
+        }
+        let note = selectedNote
+        let stats = Stats(
+            words: note?.wordCount ?? 0,
+            characters: note?.text.count ?? 0,
+            lines: note?.lineCount ?? 0
+        )
+        cachedStats = (libraryVersion, selection, stats)
+        return stats
     }
 
     var selectedNote: Note? {
@@ -200,16 +360,36 @@ final class NoteStore: ObservableObject {
     var currentText: Binding<String> {
         Binding(
             get: { self.selectedNote?.text ?? "" },
-            set: { newValue in
-                guard let index = self.selectedIndex, self.notes[index].text != newValue else { return }
-                self.notes[index].text = newValue
-                self.notes[index].updated = Date()
-                self.scheduleSave()
-                // Every match past the edit has shifted; keep the tally honest,
-                // but don't yank the view off to one of them.
-                if self.findVisible { self.scheduleFindRecount(length: newValue.utf16.count) }
-            }
+            set: { self.edit(to: $0) }
         )
+    }
+
+    /// A keystroke. Everything here is O(1) in the size of the document except
+    /// the assignment itself, and nothing on this path re-renders the window:
+    /// the text view already shows the change, and the chrome that hasn't seen
+    /// it yet catches up when the typing settles.
+    private func edit(to newValue: String) {
+        guard let index = selectedIndex else { return }
+        let previous = notes[index].text
+        // Comparing lengths first — O(1) — so an ordinary keystroke, which
+        // always changes the length, never compares two whole documents.
+        if previous.utf8.count == newValue.utf8.count, previous == newValue { return }
+
+        notes[index].text = newValue
+        notes[index].updated = Date()
+        scheduleSave()
+
+        // The placeholder under an empty document has to go the moment the
+        // first character lands, so that one change is published at once.
+        if previous.isEmpty != newValue.isEmpty {
+            libraryChanged()
+        } else {
+            libraryWillSettle()
+        }
+
+        // Every match past the edit has shifted; keep the tally honest,
+        // but don't yank the view off to one of them.
+        if findVisible { scheduleFindRecount(length: newValue.utf16.count) }
     }
 
     // MARK: - Opening files
@@ -274,6 +454,7 @@ final class NoteStore: ObservableObject {
             notes[index].file = loaded.link
             lastWritten[notes[index].id] = loaded.text
             brokenLinks.remove(notes[index].id)
+            libraryChanged()
             return notes[index].id
         }
 
@@ -285,51 +466,72 @@ final class NoteStore: ObservableObject {
         )
         notes.append(note)
         lastWritten[note.id] = loaded.text
+        libraryChanged()
         return note.id
     }
 
     // MARK: - Keeping files in step
-
-    /// Push every linked note back to its file. Called on each save.
-    private func writeLinkedFiles() {
-        for note in notes {
-            guard let link = note.file, lastWritten[note.id] != note.text else { continue }
-            do {
-                try TextFile.write(note.text, to: link)
-                lastWritten[note.id] = note.text
-                brokenLinks.remove(note.id)
-            } catch {
-                brokenLinks.insert(note.id)
-            }
-        }
-    }
 
     /// Pull in changes made outside Poe.
     ///
     /// The file wins only when it is genuinely newer than the note — otherwise
     /// keystrokes that haven't been flushed yet would lose to the older copy on
     /// disk. Run at launch and whenever the app comes back to the front.
+    ///
+    /// Reading every linked file is disk work, so it happens off the main
+    /// thread; only the decision about what to adopt is made here. Coming back
+    /// to Poe with a folder full of open files no longer stalls the window.
     func syncLinkedFiles() {
+        let links = linkedFiles()
+        guard !links.isEmpty else { return }
+        let writer = Self.writer
+        Task { [weak self] in
+            let loaded = await writer.reread(links)
+            self?.adopt(reread: loaded)
+        }
+    }
+
+    /// The blocking version, used once at launch: what is "current" cannot be
+    /// decided before we know what is on disk.
+    private func syncLinkedFilesNow() {
+        var loaded: [UUID: TextFile.Loaded?] = [:]
+        for (id, link) in linkedFiles() {
+            guard TextFile.exists(link) else { continue }
+            loaded[id] = try? TextFile.read(link.url)
+        }
+        adopt(reread: loaded)
+    }
+
+    private func linkedFiles() -> [(id: UUID, link: FileLink)] {
+        notes.compactMap { note in note.file.map { (note.id, $0) } }
+    }
+
+    /// Fold the files we just read back into the library. A note whose file was
+    /// missing from the results has gone from the disk.
+    private func adopt(reread loaded: [UUID: TextFile.Loaded?]) {
+        var changed = false
         for index in notes.indices {
-            guard let link = notes[index].file else { continue }
+            guard notes[index].file != nil else { continue }
             let id = notes[index].id
 
-            guard TextFile.exists(link) else {
+            guard let entry = loaded[id] else {
                 brokenLinks.insert(id)
                 continue
             }
             brokenLinks.remove(id)
+            guard let file = entry else { continue }
 
-            guard let loaded = try? TextFile.read(link.url) else { continue }
-            if loaded.text == notes[index].text {
-                lastWritten[id] = loaded.text
-            } else if loaded.modified > notes[index].updated {
-                notes[index].text = loaded.text
-                notes[index].file = loaded.link
-                notes[index].updated = loaded.modified
-                lastWritten[id] = loaded.text
+            if file.text == notes[index].text {
+                lastWritten[id] = file.text
+            } else if file.modified > notes[index].updated {
+                notes[index].text = file.text
+                notes[index].file = file.link
+                notes[index].updated = file.modified
+                lastWritten[id] = file.text
+                changed = true
             }
         }
+        if changed { libraryChanged() }
     }
 
     /// Discard local edits and take whatever the file says now.
@@ -342,6 +544,7 @@ final class NoteStore: ObservableObject {
             notes[index].updated = loaded.modified
             lastWritten[notes[index].id] = loaded.text
             brokenLinks.remove(notes[index].id)
+            libraryChanged()
             scheduleSave()
         } catch {
             message = PoeMessage(title: "Couldn’t reload", body: error.localizedDescription)
@@ -355,6 +558,7 @@ final class NoteStore: ObservableObject {
         brokenLinks.remove(notes[index].id)
         notes[index].file = nil
         notes[index].updated = Date()
+        libraryChanged()
         scheduleSave()
     }
 
@@ -372,6 +576,7 @@ final class NoteStore: ObservableObject {
         } else {
             let note = Note()
             notes.append(note)
+            libraryChanged()
             selection = note.id
             scheduleSave()
         }
@@ -388,6 +593,7 @@ final class NoteStore: ObservableObject {
         notes.remove(at: index)
         lastWritten[id] = nil
         brokenLinks.remove(id)
+        libraryChanged()
         if wasSelected {
             let remaining = visible
             if let position, !remaining.isEmpty {
@@ -424,6 +630,7 @@ final class NoteStore: ObservableObject {
     func togglePin(_ id: UUID) {
         guard let index = notes.firstIndex(where: { $0.id == id }) else { return }
         notes[index].pinned.toggle()
+        libraryChanged()
         scheduleSave()
     }
 
@@ -437,6 +644,7 @@ final class NoteStore: ObservableObject {
         guard let note = selectedNote else { return }
         let copy = Note(text: note.text)
         notes.append(copy)
+        libraryChanged()
         selection = copy.id
         scheduleSave()
     }
@@ -635,6 +843,7 @@ final class NoteStore: ObservableObject {
             notes[index].file = link
             lastWritten[notes[index].id] = notes[index].text
             brokenLinks.remove(notes[index].id)
+            libraryChanged()
             scheduleSave()
         } catch {
             message = PoeMessage(title: "Couldn’t save", body: error.localizedDescription)

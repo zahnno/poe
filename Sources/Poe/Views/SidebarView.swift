@@ -97,13 +97,16 @@ struct SidebarView: View {
     // MARK: - List
 
     private var list: some View {
-        ScrollView {
+        // Asked for once, not once per mention: this sorts the library and
+        // reads every note to sift it.
+        let visible = store.visible
+        return ScrollView {
             LazyVStack(spacing: 4) {
-                ForEach(store.visible) { note in
+                ForEach(visible) { note in
                     row(note)
                 }
 
-                if store.visible.isEmpty {
+                if visible.isEmpty {
                     Text("Nothing matches “\(store.query)”")
                         .font(.system(size: 12, design: .rounded))
                         .foregroundStyle(Theme.inkFaint)

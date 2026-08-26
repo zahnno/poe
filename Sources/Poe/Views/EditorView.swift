@@ -143,9 +143,12 @@ struct EditorView: View {
     /// Swapping them as `if/else` branches would make SwiftUI rebuild the
     /// `NSTextView` on every toggle, losing undo history and the caret with it.
     private var content: some View {
-        ZStack(alignment: .topLeading) {
+        // Fetched once. Every mention of it walks the library for the selected
+        // note and hands back its text.
+        let text = store.currentText.wrappedValue
+        return ZStack(alignment: .topLeading) {
             PoeTextView(
-                text: store.currentText.wrappedValue,
+                text: text,
                 onEdit: { store.currentText.wrappedValue = $0 },
                 documentID: store.selection,
                 focusToken: store.editorFocusToken,
@@ -165,7 +168,7 @@ struct EditorView: View {
             )
             .opacity(store.previewing ? 0 : 1)
 
-            if !store.previewing, store.currentText.wrappedValue.isEmpty {
+            if !store.previewing, text.isEmpty {
                 Text(note?.file == nil ? "Start writing…" : "This file is empty — start writing…")
                     .font(.system(size: 15, design: .monospaced))
                     .foregroundStyle(Theme.inkFaint.opacity(0.6))
@@ -176,7 +179,7 @@ struct EditorView: View {
 
             if store.previewing {
                 MarkdownPreview(
-                    text: store.currentText.wrappedValue,
+                    text: text,
                     find: MarkdownPreview.Find(
                         matches: store.findVisible ? store.findMatches : [],
                         current: store.findIndex,
@@ -220,16 +223,19 @@ struct EditorView: View {
     private var statusBar: some View {
         HStack(spacing: 14) {
             if let note, !note.isEmpty {
+                // Three passes over the whole document, counted once per
+                // settled change rather than once per redraw.
+                let stats = store.stats
                 if note.kind.rendersMarkdown {
-                    stat("\(note.wordCount)", "words")
+                    stat("\(stats.words)", "words")
                 } else {
-                    stat("\(note.lineCount)", "lines")
+                    stat("\(stats.lines)", "lines")
                 }
                 dot
-                stat("\(note.text.count)", "chars")
-                if note.kind.rendersMarkdown, note.wordCount > 40 {
+                stat("\(stats.characters)", "chars")
+                if note.kind.rendersMarkdown, stats.words > 40 {
                     dot
-                    stat("\(Int(ceil(Double(note.wordCount) / 220.0)))", "min read")
+                    stat("\(Int(ceil(Double(stats.words) / 220.0)))", "min read")
                 }
             }
 

@@ -18,7 +18,12 @@ struct RootView: View {
                 EditorView()
                     .frame(maxWidth: .infinity)
             }
-            .background(.ultraThinMaterial.opacity(0.35))
+            // A flat veil, not `.ultraThinMaterial`. A material is a live
+            // backdrop blur, and this one covered the whole window over a
+            // background that never stops moving — so it re-blurred every
+            // pixel behind it, every frame, for a softness the aurora's own
+            // gradients already provide.
+            .background(Color.white.opacity(0.025))
 
             if dropTargeted { dropOverlay }
         }
@@ -64,7 +69,7 @@ struct RootView: View {
             // Start in the note itself — the search field can wait for Cmd F.
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) { store.focusEditor() }
         }
-        .onDisappear { store.saveNow() }
+        .onDisappear { store.saveAndWait() }
     }
 
     // MARK: - Dropping files

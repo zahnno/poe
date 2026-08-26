@@ -1,10 +1,17 @@
+import AppKit
 import SwiftUI
 
-/// Three slow blurred orbs drifting behind the glass.
+/// Four slow orbs drifting behind the glass.
 ///
-/// Everything is driven by `repeatForever` animations on transform properties,
-/// so the whole effect is handed to the compositor — no per-frame CPU work,
-/// no timer, nothing to spin the fans up while you type.
+/// The drift is a `repeatForever` animation on nothing but offsets, so what it
+/// costs per frame is what those offsets have to move. That used to be four
+/// full-screen gaussian blurs: `.blur(radius: 60)` on a drifting 620pt circle
+/// is re-run every frame, for a shape whose edge already fades to nothing. The
+/// softness is baked into the gradient stops instead, which the compositor
+/// draws once and then simply slides about.
+///
+/// The animation itself still has to be evaluated every frame for as long as it
+/// runs, so it doesn't run while the app has nothing on screen.
 struct AuroraBackground: View {
     @State private var drift = false
 
@@ -12,19 +19,19 @@ struct AuroraBackground: View {
         ZStack {
             Theme.void
 
-            orb(Theme.accentDeep, size: 620)
+            orb(Theme.accentDeep, size: 700)
                 .offset(x: drift ? -180 : -260, y: drift ? -220 : -140)
                 .opacity(0.55)
 
-            orb(Theme.violet, size: 540)
+            orb(Theme.violet, size: 620)
                 .offset(x: drift ? 260 : 180, y: drift ? -60 : -180)
                 .opacity(0.45)
 
-            orb(Theme.accent, size: 460)
+            orb(Theme.accent, size: 540)
                 .offset(x: drift ? 40 : 160, y: drift ? 280 : 200)
                 .opacity(0.30)
 
-            orb(Theme.rose, size: 380)
+            orb(Theme.rose, size: 460)
                 .offset(x: drift ? -280 : -180, y: drift ? 260 : 320)
                 .opacity(0.22)
 
@@ -40,25 +47,53 @@ struct AuroraBackground: View {
             )
         }
         .ignoresSafeArea()
-        .onAppear {
-            withAnimation(.easeInOut(duration: 22).repeatForever(autoreverses: true)) {
-                drift.toggle()
-            }
+        // Deliberately *not* a `.drawingGroup()`: the drift lives inside this
+        // stack, so flattening it would force an offscreen render of the whole
+        // background every frame instead of letting the compositor slide four
+        // gradient layers around.
+        .onAppear(perform: start)
+        .onReceive(NotificationCenter.default.publisher(
+            for: NSApplication.didChangeOcclusionStateNotification
+        )) { _ in
+            // A `repeatForever` animation is evaluated every frame for as long
+            // as it runs, whether or not there is anyone to see it. When every
+            // window is hidden — minimised, covered, another app full-screen
+            // over the top — there is nothing to draw, so stop drawing it.
+            if NSApp.occlusionState.contains(.visible) { start() } else { stop() }
         }
     }
 
+    private func start() {
+        guard !drift else { return }
+        withAnimation(.easeInOut(duration: 22).repeatForever(autoreverses: true)) {
+            drift = true
+        }
+    }
+
+    private func stop() {
+        withAnimation(.linear(duration: 0)) { drift = false }
+    }
+
+    /// A gaussian-ish falloff, in stops. The tail matters more than the middle:
+    /// it is what stops the circle reading as a circle.
     private func orb(_ color: Color, size: CGFloat) -> some View {
         Circle()
             .fill(
                 RadialGradient(
-                    colors: [color, color.opacity(0)],
+                    gradient: Gradient(stops: [
+                        .init(color: color, location: 0.00),
+                        .init(color: color.opacity(0.78), location: 0.26),
+                        .init(color: color.opacity(0.44), location: 0.46),
+                        .init(color: color.opacity(0.20), location: 0.64),
+                        .init(color: color.opacity(0.07), location: 0.80),
+                        .init(color: color.opacity(0.00), location: 1.00)
+                    ]),
                     center: .center,
                     startRadius: 0,
                     endRadius: size / 2
                 )
             )
             .frame(width: size, height: size)
-            .blur(radius: 60)
     }
 }
 

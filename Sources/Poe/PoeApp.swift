@@ -136,7 +136,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationWillTerminate(_ notification: Notification) {
-        NoteStore.shared.saveNow()
+        NoteStore.shared.saveAndWait()
     }
 }
 

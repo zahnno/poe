@@ -8,6 +8,9 @@ enum Theme {
     static let panel       = Color.white.opacity(0.045)
     static let panelStroke = Color.white.opacity(0.075)
     static let hairline    = Color.white.opacity(0.055)
+    /// Behind a fenced code block in the preview — what the glass panel there
+    /// used to resolve to, without the live blur behind it.
+    static let codePanel   = Color.white.opacity(0.075)
 
     static let ink         = Color(red: 0.898, green: 0.914, blue: 0.961)
     static let inkDim      = Color(red: 0.596, green: 0.627, blue: 0.714)
@@ -68,6 +71,20 @@ extension View {
     }
 }
 
+/// Built once. A `DateFormatter` costs about a tenth of a millisecond to
+/// create, and the sidebar was building one per row per redraw.
+private enum PoeFormatters {
+    static let weekday = formatter("EEE")
+    static let day = formatter("MMM d")
+    static let dayAndYear = formatter("MMM d, yy")
+
+    private static func formatter(_ format: String) -> DateFormatter {
+        let formatter = DateFormatter()
+        formatter.dateFormat = format
+        return formatter
+    }
+}
+
 extension Date {
     /// "now", "12m", "3h", "Tue", "Mar 4" — short enough for a 260pt sidebar.
     var poeRelative: String {
@@ -75,13 +92,8 @@ extension Date {
         if seconds < 60 { return "now" }
         if seconds < 3_600 { return "\(Int(seconds / 60))m" }
         if seconds < 86_400 { return "\(Int(seconds / 3_600))h" }
-        if seconds < 604_800 {
-            let f = DateFormatter()
-            f.dateFormat = "EEE"
-            return f.string(from: self)
-        }
-        let f = DateFormatter()
-        f.dateFormat = Calendar.current.isDate(self, equalTo: Date(), toGranularity: .year) ? "MMM d" : "MMM d, yy"
-        return f.string(from: self)
+        if seconds < 604_800 { return PoeFormatters.weekday.string(from: self) }
+        let sameYear = Calendar.current.isDate(self, equalTo: Date(), toGranularity: .year)
+        return (sameYear ? PoeFormatters.day : PoeFormatters.dayAndYear).string(from: self)
     }
 }

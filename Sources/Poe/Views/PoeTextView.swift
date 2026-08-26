@@ -55,7 +55,11 @@ struct PoeTextView: NSViewRepresentable {
     /// ⌘P still renders the whole thing.
     static let stylingLimit = 60_000
 
-    var styled: Bool { kind.rendersMarkdown && text.count <= Self.stylingLimit }
+    /// Measured in UTF-8 bytes, which a Swift string already knows, rather
+    /// than in characters, which it has to walk the whole document to count —
+    /// this is asked on every keystroke and every redraw. Bytes only ever
+    /// over-estimate, so the limit still holds.
+    var styled: Bool { kind.rendersMarkdown && text.utf8.count <= Self.stylingLimit }
     var dense: Bool { !kind.rendersMarkdown }
 
     func makeCoordinator() -> Coordinator { Coordinator(self) }
@@ -73,7 +77,7 @@ struct PoeTextView: NSViewRepresentable {
 
         textView.identifier = PoeTextView.identifier
         textView.delegate = context.coordinator
-        textView.string = text
+        context.coordinator.replace(textView, with: text)
         textView.isRichText = false
         textView.allowsUndo = true
         textView.drawsBackground = false
@@ -101,6 +105,7 @@ struct PoeTextView: NSViewRepresentable {
 
         context.coordinator.apply(to: textView)
         context.coordinator.watchScrolling(of: scrollView)
+        EditorTextView.register(textView)
         return scrollView
     }
 
@@ -117,15 +122,15 @@ struct PoeTextView: NSViewRepresentable {
             context.coordinator.rememberCaret(in: textView)
             context.coordinator.documentID = documentID
             textView.inputContext?.discardMarkedText()
-            textView.string = text
+            context.coordinator.replace(textView, with: text)
             context.coordinator.apply(to: textView)
             textView.undoManager?.removeAllActions()
             context.coordinator.restoreCaret(in: textView)
-        } else if textView.string != text {
+        } else if !context.coordinator.holds(text) {
             // Same document, new text: a reload from disk, or a change made
             // outside Poe. Keep the caret where the writer left it.
             let selected = textView.selectedRange()
-            textView.string = text
+            context.coordinator.replace(textView, with: text)
             context.coordinator.apply(to: textView)
             let limit = (text as NSString).length
             textView.setSelectedRange(NSRange(location: min(selected.location, limit), length: 0))
@@ -161,6 +166,35 @@ struct PoeTextView: NSViewRepresentable {
         private var carets: [UUID: Int] = [:]
         /// What was last drawn, so an update that changes nothing costs nothing.
         private var findState = FindState()
+        /// Exactly which ranges carry a highlight, so clearing one doesn't mean
+        /// sweeping temporary attributes off the whole document — which asks
+        /// TextKit to reconsider every line in it.
+        private var lit: [Highlight] = []
+        /// The text the buffer is known to hold.
+        ///
+        /// SwiftUI hands this view the document on every update, and the old
+        /// code asked `textView.string != text` — building a `String` from the
+        /// storage and comparing two whole documents, on every redraw. Holding
+        /// on to the string that went in means the usual answer costs a pointer
+        /// comparison: Swift compares identical string buffers by identity.
+        private var knownText = ""
+
+        struct Highlight: Equatable {
+            var range: NSRange
+            var current: Bool
+        }
+
+        /// Is this the text the buffer already holds?
+        func holds(_ text: String) -> Bool {
+            knownText.utf8.count == text.utf8.count && knownText == text
+        }
+
+        /// Put a whole new document in the buffer, remembering what it was.
+        func replace(_ textView: NSTextView, with text: String) {
+            textView.string = text
+            knownText = text
+            lit = []
+        }
 
         static func paragraphStyle(dense: Bool) -> NSParagraphStyle {
             let style = NSMutableParagraphStyle()
@@ -202,6 +236,7 @@ struct PoeTextView: NSViewRepresentable {
             guard let storage = textView.textStorage else { return }
             let attributes = Self.attributes(dense: parent.dense)
             storage.setAttributes(attributes, range: NSRange(location: 0, length: storage.length))
+            lit = []
             textView.typingAttributes = attributes
             textView.defaultParagraphStyle = Self.paragraphStyle(dense: parent.dense)
             styledRange = nil
@@ -263,6 +298,9 @@ struct PoeTextView: NSViewRepresentable {
             restyleVisible(textView, force: false)
             // Not part of the restyle: code and very long documents never reach
             // it, and their matches still have to light up as they scroll in.
+            // With no search up there is nothing to relight, and this fires on
+            // every frame of every scroll.
+            guard findState.active || !lit.isEmpty else { return }
             highlightFind(in: textView)
         }
 
@@ -291,7 +329,12 @@ struct PoeTextView: NSViewRepresentable {
 
         func textDidChange(_ notification: Notification) {
             guard let textView = notification.object as? NSTextView else { return }
-            parent.onEdit(textView.string)
+            // Read out of the storage once. The very same string then goes to
+            // the store and stays here, so the update that comes back knows
+            // itself on sight.
+            let text = textView.string
+            knownText = text
+            parent.onEdit(text)
             restyleCaretParagraph(in: textView)
             scheduleRestyle(of: textView)
         }
@@ -326,22 +369,56 @@ struct PoeTextView: NSViewRepresentable {
         /// Only what's on screen is lit — a match in a 2 MB file costs nothing
         /// until you scroll to it.
         private func highlightFind(in textView: NSTextView) {
-            guard let layoutManager = textView.layoutManager else { return }
-            let whole = NSRange(location: 0, length: (textView.string as NSString).length)
-            layoutManager.removeTemporaryAttribute(.backgroundColor, forCharacterRange: whole)
-            layoutManager.removeTemporaryAttribute(.foregroundColor, forCharacterRange: whole)
-            guard findState.active, !findState.matches.isEmpty else { return }
+            guard let layoutManager = textView.layoutManager,
+                  let storage = textView.textStorage else { return }
+            let wanted = highlights(in: textView, length: storage.length)
+            // Scrolling a long document fires this on every frame; most of them
+            // want exactly what is already drawn.
+            guard wanted != lit else { return }
 
-            let onScreen = visibleRange(of: textView)
-            for (index, range) in findState.matches.map(\.range).enumerated() {
-                guard NSMaxRange(range) <= whole.length else { continue }
-                let current = index + 1 == findState.current
-                guard current || NSIntersectionRange(range, onScreen).length > 0 else { continue }
+            for highlight in lit {
+                layoutManager.removeTemporaryAttribute(.backgroundColor, forCharacterRange: highlight.range)
+                layoutManager.removeTemporaryAttribute(.foregroundColor, forCharacterRange: highlight.range)
+            }
+            for highlight in wanted {
                 layoutManager.addTemporaryAttributes(
-                    current ? Self.currentMatch : Self.otherMatch,
-                    forCharacterRange: range
+                    highlight.current ? Self.currentMatch : Self.otherMatch,
+                    forCharacterRange: highlight.range
                 )
             }
+            lit = wanted
+        }
+
+        /// Which matches should be lit: the ones on screen, plus the current
+        /// one wherever it is. A document can hold twenty thousand matches, so
+        /// the on-screen run is found by bisection rather than by walking them.
+        private func highlights(in textView: NSTextView, length: Int) -> [Highlight] {
+            guard findState.active, !findState.matches.isEmpty else { return [] }
+            let matches = findState.matches
+            let onScreen = visibleRange(of: textView)
+
+            var found: [Highlight] = []
+            if let current = findState.currentRange, NSMaxRange(current) <= length {
+                found.append(Highlight(range: current, current: true))
+            }
+
+            // First match that could still reach into the visible range.
+            var low = 0, high = matches.count
+            while low < high {
+                let middle = (low + high) / 2
+                if NSMaxRange(matches[middle].range) <= onScreen.location { low = middle + 1 } else { high = middle }
+            }
+
+            var index = low
+            while index < matches.count, matches[index].range.location < NSMaxRange(onScreen) {
+                let range = matches[index].range
+                let ordinal = index + 1
+                index += 1
+                // The current one is already in, wherever it happens to be.
+                guard NSMaxRange(range) <= length, ordinal != findState.current else { continue }
+                found.append(Highlight(range: range, current: false))
+            }
+            return found
         }
 
         private static let currentMatch: [NSAttributedString.Key: Any] = [
@@ -369,9 +446,20 @@ struct PoeTextView: NSViewRepresentable {
 /// thing it needs, the writer's selection, has to be fetched from the responder
 /// tree by hand.
 enum EditorTextView {
+    /// The editor registers itself when it is built, so finding it later is a
+    /// lookup rather than a walk of every view in every window — which is what
+    /// ⌘F did, on each recount, to ask where the caret was.
+    private static weak var registered: NSTextView?
+
+    static func register(_ textView: NSTextView) { registered = textView }
+
     static var current: NSTextView? {
+        if let registered, registered.window != nil { return registered }
         for window in NSApp.windows where window.isVisible {
-            if let root = window.contentView, let found = search(root) { return found }
+            if let root = window.contentView, let found = search(root) {
+                registered = found
+                return found
+            }
         }
         return nil
     }

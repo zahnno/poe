@@ -13,6 +13,17 @@ A quiet place to think — a native macOS notepad. Dark, glassy, keyboard-first,
 and it saves itself. It opens your files too: Markdown, plain text, code, or
 anything else made of text, edited in place.
 
+## The tour
+
+![A demo of Poe](assets/demo.svg)
+
+<sub>That's not a video — it's one self-animating SVG (~90 KB, no plugin, no
+autoplay policy to fight), drawn from the same palette the app uses. There's a
+scored version too, with sound: **[assets/demo.mp4](assets/demo.mp4)** (28s,
+1920×1230 — GitHub won't play a video that lives in a repo, so `open
+assets/demo.mp4`). Rebuild either with `python3 tools/make_demo.py` and
+`./tools/make_demo_video.sh`. And the real thing, in pixels:</sub>
+
 ![Poe](assets/screenshot.png)
 
 ## Install
@@ -210,8 +221,12 @@ Sources/Poe/
   Views/AuroraBackground.swift
   DebugSnapshot.swift   Dev-only smoke test (see below)
 tools/make_icon.swift   Cuts the app icon out of assets/AppIcon.png, every size
+tools/make_demo.py      Draws assets/demo.svg — the animated tour up top
+tools/capture_frames.mjs   Rasterises that SVG frame by frame, over CDP
+tools/make_demo_video.sh   Frames + assets/audio/ stems → assets/demo.mp4
 tools/file_tests/       Headless checks for the file layer (see below)
 assets/lantern.svg      The mark again, as SVG — same geometry, same bronze
+assets/audio/           Bed and effects for the video, generated once
 ```
 
 ## Smoke test
@@ -274,3 +289,13 @@ swiftc Sources/Poe/Model/TextFile.swift Sources/Poe/Model/Note.swift \
   100 KB note — invisible until files could be opened and one of them was large.
 - The aurora is four blurred orbs on `repeatForever` transform animations, so
   the compositor owns it and nothing spins the fans while you type.
+- The demo at the top is generated, not recorded. Every animation in it runs the
+  full 28s of the timeline and repeats forever, with the scene changes encoded in
+  `keyTimes` — give each element its own `begin` offset instead and the loop
+  drifts out of sync on the second pass. The typing is a clip rectangle per line
+  whose width steps one character at a time, which is why the caret and the text
+  can never disagree about where the next letter goes.
+- The video is rendered, not recorded. `capture_frames.mjs` pauses the SVG's SMIL
+  clock and asks for frame *n* at exactly *n*/30 s, which is the only reason a
+  sound effect can be placed at a timecode and land on the frame it belongs to —
+  a screen recorder would hand back whatever Chrome happened to paint.

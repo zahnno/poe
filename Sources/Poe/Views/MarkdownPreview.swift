@@ -29,7 +29,7 @@ struct MarkdownPreview: View {
     init(text: String, find: Find = Find()) {
         self.text = text
         self.find = find
-        self.blocks = Self.parse(text)
+        self.blocks = Self.blocks(of: text)
         self.marks = Dictionary(
             grouping: find.matches.enumerated().compactMap { ordinal, match in
                 match.block.map { (block: $0, ordinal: ordinal + 1, range: match.range) }
@@ -42,8 +42,8 @@ struct MarkdownPreview: View {
         ScrollView {
             ScrollViewReader { scroller in
                 LazyVStack(alignment: .leading, spacing: 12) {
-                    ForEach(Array(blocks.enumerated()), id: \.offset) { index, block in
-                        view(for: block, at: index)
+                    ForEach(blocks.indices, id: \.self) { index in
+                        view(for: blocks[index], at: index)
                             .id(index)
                     }
                 }
@@ -79,6 +79,29 @@ struct MarkdownPreview: View {
         case paragraph(String)
         case blank
     }
+
+    /// The last document parsed, kept whole.
+    ///
+    /// `init` runs on every pass of the parent's body — every keystroke, every
+    /// selection change — and used to re-split and re-classify the entire
+    /// document each time, which the comment above claimed it didn't. It does
+    /// now: same text, same blocks, no work.
+    private static var parsed: (text: String, blocks: [Block])?
+
+    fileprivate static func blocks(of text: String) -> [Block] {
+        if let parsed, parsed.text.utf8.count == text.utf8.count, parsed.text == text {
+            return parsed.blocks
+        }
+        let blocks = parse(text)
+        parsed = (text, blocks)
+        return blocks
+    }
+
+    /// Inline markdown, parsed once per distinct line rather than once per
+    /// line per redraw — `AttributedString(markdown:)` is a real parser, and
+    /// scrolling the preview was running it over every visible block on every
+    /// frame.
+    private static var inlineCache: [String: AttributedString] = [:]
 
     private static func parse(_ text: String) -> [Block] {
         var result: [Block] = []
@@ -129,7 +152,7 @@ struct MarkdownPreview: View {
     /// Index for index the same blocks the view lays out, so a match knows
     /// which one it belongs to.
     static func visibleBlocks(of text: String) -> [String] {
-        parse(text).map(visible)
+        blocks(of: text).map(visible)
     }
 
     private static func visible(_ block: Block) -> String {
@@ -144,10 +167,17 @@ struct MarkdownPreview: View {
     }
 
     private static func attributed(_ value: String) -> AttributedString {
-        (try? AttributedString(
+        if let cached = inlineCache[value] { return cached }
+        let parsed = (try? AttributedString(
             markdown: value,
             options: .init(interpretedSyntax: .inlineOnlyPreservingWhitespace)
         )) ?? AttributedString(value)
+        // A plain ceiling rather than a real LRU: this only has to survive one
+        // screenful being redrawn, and a document's worth of lines is more than
+        // enough for that.
+        if inlineCache.count > 2_000 { inlineCache.removeAll(keepingCapacity: true) }
+        inlineCache[value] = parsed
+        return parsed
     }
 
     @ViewBuilder
@@ -187,7 +217,16 @@ struct MarkdownPreview: View {
                 .foregroundStyle(Theme.accent.opacity(0.92))
                 .padding(14)
                 .frame(maxWidth: .infinity, alignment: .leading)
-                .glass(radius: 12)
+                // Flat, not `.glass` — a material is a live backdrop blur, and
+                // a document can hold a hundred code blocks.
+                .background(
+                    RoundedRectangle(cornerRadius: 12, style: .continuous)
+                        .fill(Theme.codePanel)
+                )
+                .overlay(
+                    RoundedRectangle(cornerRadius: 12, style: .continuous)
+                        .strokeBorder(Theme.panelStroke, lineWidth: 1)
+                )
 
         case .rule:
             Rectangle()

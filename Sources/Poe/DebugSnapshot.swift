@@ -3,7 +3,9 @@ import Foundation
 import QuartzCore
 
 /// Dev-only harness. POE_SNAPSHOT=<base> renders the live window to PNGs;
-/// POE_SELFTEST=1 additionally drives the app through its main flows.
+/// POE_SELFTEST=1 additionally drives the app through its main flows, and
+/// POE_SELFTEST=bench times a keystroke from the key down to the window
+/// settling (POE_BENCH_NOTES / POE_BENCH_SIZE / POE_BENCH_STROKES).
 @MainActor
 enum DebugSnapshot {
     static func runIfRequested() {
@@ -23,6 +25,13 @@ enum DebugSnapshot {
         // POE_SELFTEST=find exercises ⌘F: find inside the open note.
         if scenario == "find" {
             findFlow(base: base)
+            return
+        }
+
+        // POE_SELFTEST=bench types into a full library and times each keystroke,
+        // window update included.
+        if scenario == "bench" {
+            benchFlow()
             return
         }
 
@@ -87,7 +96,7 @@ enum DebugSnapshot {
         }
 
         after(start + 5.1) {
-            store.saveNow()
+            store.saveAndWait()
             let disk = ((try? String(contentsOf: url, encoding: .utf8)) ?? "")
                 .replacingOccurrences(of: "\r\n", with: "\n")
             check("edit reaches disk", disk.contains("## Appended by the self test"))
@@ -140,21 +149,30 @@ enum DebugSnapshot {
             // The file goes missing under us.
             try? FileManager.default.removeItem(at: url)
             store.syncLinkedFiles()
+        }
+
+        // Reading the disk and writing to it both happen off the main thread
+        // now, so these checks look after the call rather than inside it — and
+        // leave room for a `capture` on the main thread to finish first.
+        after(start + 11.2) {
             let id = store.selection ?? UUID()
             check("missing file is flagged", store.brokenLinks.contains(id))
             capture(to: base + "-missing.png")
         }
 
-        after(start + 10.3) {
+        after(start + 12.4) {
             // Keep writing and Poe puts the file back rather than losing words.
             store.currentText.wrappedValue = "Written after the file went missing.\n"
-            store.saveNow()
+            store.saveAndWait()
+        }
+
+        after(start + 13.0) {
             let restored = (try? String(contentsOf: url, encoding: .utf8)) ?? ""
             check("saving restores the file", restored == "Written after the file went missing.\n")
             check("flag clears once the write lands", !store.brokenLinks.contains(store.selection ?? UUID()))
         }
 
-        after(start + 11.5) {
+        after(start + 14.6) {
             try? FileManager.default.removeItem(at: binary)
             print("SELFTEST: \(failures) failed check(s)")
             NSApp.terminate(nil)
@@ -307,6 +325,71 @@ enum DebugSnapshot {
             else { after(0.2) { poll(remaining - 0.2) } }
         }
         poll(seconds)
+    }
+
+    /// What one keystroke costs, end to end.
+    ///
+    /// Builds a library of the size someone actually keeps, opens a long note
+    /// in it, then types a character at a time — forcing the window to settle
+    /// after each one, so the measurement includes everything the keystroke set
+    /// in motion, not just the insert.
+    private static func benchFlow() {
+        let store = NoteStore.shared
+        let notes = Int(ProcessInfo.processInfo.environment["POE_BENCH_NOTES"] ?? "") ?? 20
+        let size = Int(ProcessInfo.processInfo.environment["POE_BENCH_SIZE"] ?? "") ?? 40_000
+        let strokes = Int(ProcessInfo.processInfo.environment["POE_BENCH_STROKES"] ?? "") ?? 150
+
+        var body = "Bench Note\n\n"
+        var paragraph = 0
+        while body.utf8.count < size {
+            body += "## Section \(paragraph)\nProse about **things** and `code`, running on a while.\n\n"
+            paragraph += 1
+        }
+
+        after(1.5) {
+            for index in 0..<notes {
+                store.newNote()
+                store.currentText.wrappedValue = "Note \(index)\n\n" + body
+            }
+            store.newNote()
+            store.currentText.wrappedValue = body
+        }
+
+        after(3.5) {
+            guard let textView = findTextView(), let view = textView.window?.contentView else {
+                print("BENCH: no editor"); NSApp.terminate(nil); return
+            }
+            textView.window?.makeFirstResponder(textView)
+            textView.setSelectedRange(NSRange(location: (textView.string as NSString).length, length: 0))
+
+            @MainActor func settle() {
+                view.layoutSubtreeIfNeeded()
+                CATransaction.flush()
+                view.displayIfNeeded()
+            }
+
+            // Warm the caches the first keystroke would otherwise pay for.
+            for _ in 0..<10 {
+                textView.insertText("w", replacementRange: textView.selectedRange())
+                settle()
+            }
+
+            var samples: [Double] = []
+            for _ in 0..<strokes {
+                let started = CFAbsoluteTimeGetCurrent()
+                textView.insertText("a", replacementRange: textView.selectedRange())
+                settle()
+                samples.append((CFAbsoluteTimeGetCurrent() - started) * 1000)
+            }
+            samples.sort()
+            let mean = samples.reduce(0, +) / Double(samples.count)
+            print(String(
+                format: "BENCH notes=%d size=%dKB  mean %.3f ms  median %.3f ms  p95 %.3f ms  max %.3f ms",
+                notes + 1, size / 1000, mean,
+                samples[samples.count / 2], samples[Int(Double(samples.count) * 0.95)], samples[samples.count - 1]
+            ))
+            NSApp.terminate(nil)
+        }
     }
 
     private static func check(_ label: String, _ passed: Bool) {
