@@ -57,6 +57,13 @@ enum DebugSnapshot {
             return
         }
 
+        // POE_SELFTEST=scroll drags a long note past the window, with a search
+        // up, and asks whether the scroll actually went anywhere.
+        if scenario == "scroll" {
+            scrollFlow()
+            return
+        }
+
         if scenario == "live" {
             LiveBench.run()
             return
@@ -352,6 +359,111 @@ enum DebugSnapshot {
             capture(to: base + "-find-closed.png")
             print("SELFTEST: \(failures) failed check(s)")
             NSApp.terminate(nil)
+        }
+    }
+
+    /// Scrolling a long note, before and after a search.
+    ///
+    /// Steps the clip view down the way a drag does and watches two things a
+    /// scroll must not do: land anywhere but where it was pushed, and restyle
+    /// on every frame. Styling relays out the lines under the reader, so a
+    /// scroll that pays for one per frame is a scroll that shudders in place —
+    /// which is what a search used to leave behind, its jump having stranded
+    /// the styled window somewhere the reader no longer was.
+    private static func scrollFlow() {
+        let store = NoteStore.shared
+        var body = "Long Note\n\n"
+        var paragraph = 0
+        while body.utf8.count < 40_000 {
+            body += "## Section \(paragraph)\nProse about lantern and **things** and `code`, running on a while.\nA second line with lantern in it too, so the search has plenty to find.\n\n"
+            paragraph += 1
+        }
+
+        after(1.5) {
+            store.newNote()
+            store.currentText.wrappedValue = body
+        }
+
+        /// Is the markdown on screen actually styled? The point of restyling
+        /// less often is that scrolling still never shows a heading as raw text.
+        func headingStyled(_ textView: NSTextView) -> Bool {
+            guard let storage = textView.textStorage,
+                  let layoutManager = textView.layoutManager,
+                  let container = textView.textContainer else { return false }
+            let glyphs = layoutManager.glyphRange(forBoundingRect: textView.visibleRect, in: container)
+            let visible = layoutManager.characterRange(forGlyphRange: glyphs, actualGlyphRange: nil)
+            let text = storage.string as NSString
+            let heading = text.range(of: "## Section", options: [], range: visible)
+            guard heading.location != NSNotFound else { return false }
+            // The words after the marker, which a styled heading grows.
+            let title = heading.location + 3
+            let font = storage.attribute(.font, at: title, effectiveRange: nil) as? NSFont
+            return (font?.pointSize ?? 0) > Theme.editorFont.pointSize
+        }
+
+        /// One drag, a frame per turn of the run loop — nested run loops don't
+        /// drain the main queue, and catching up with a scroll is the one thing
+        /// that happens there.
+        func drag(_ label: String, steps: Int = 40, by delta: CGFloat = 200, then done: @escaping () -> Void) {
+            guard let textView = findTextView(), let scrollView = textView.enclosingScrollView else {
+                check("scroll view exists", false)
+                return done()
+            }
+            let clip = scrollView.contentView
+            let start = clip.bounds.origin.y
+            let styled = MarkdownStyle.passes
+            var drift: [Int] = []
+
+            func frame(_ remaining: Int) {
+                guard remaining > 0 else {
+                    let travelled = clip.bounds.origin.y - start
+                    let asked = delta * CGFloat(steps)
+                    let restyles = MarkdownStyle.passes - styled
+                    print("SELFTEST: [\(label)] \(steps) frames, \(restyles) restyle(s), drift \(drift)")
+                    check("[\(label)] the scroll went where it was pushed", travelled > asked * 0.8)
+                    check("[\(label)] nothing pulled it back", drift.allSatisfy { $0 == 0 })
+                    check("[\(label)] the headings on screen are styled", headingStyled(textView))
+                    check("[\(label)] the frames didn't each pay for a restyle", restyles * 3 < steps)
+                    return done()
+                }
+                let wanted = clip.bounds.origin.y + delta
+                clip.scroll(to: NSPoint(x: clip.bounds.origin.x, y: wanted))
+                scrollView.reflectScrolledClipView(clip)
+                after(0.016) {
+                    // Where it ended up against where it was put: anything but
+                    // zero is something pulling the view somewhere else.
+                    drift.append(Int(clip.bounds.origin.y - wanted))
+                    frame(remaining - 1)
+                }
+            }
+            frame(steps)
+        }
+
+        after(3.0) {
+            drag("plain") {
+                trigger("Find in Note…")
+                store.findQuery = "lantern"
+                after(1.0) {
+                    check("the search found matches (\(store.findCount))", store.findCount > 10)
+                    drag("with the search up") {
+                        // Stepping through matches is what used to strand the
+                        // styled window: ⌘G can put the reader anywhere.
+                        for _ in 0..<20 { store.findNext() }
+                        after(0.5) {
+                            drag("after stepping through matches") {
+                                store.hideFind()
+                                after(0.5) {
+                                    check("the bar is closed", !store.findVisible)
+                                    drag("after the search") {
+                                        print("SELFTEST: \(failures) failed check(s)")
+                                        NSApp.terminate(nil)
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
         }
     }
 

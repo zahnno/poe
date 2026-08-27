@@ -251,8 +251,21 @@ cp somewhere/notes.md /tmp/case.md
 POE_SELFTEST=file POE_SNAPSHOT=/tmp/poe POE_OPEN=/tmp/case.md .build/release/Poe
 ```
 
-It rewrites the file it is given, so hand it a copy. The parts that need no
-window run without one:
+It rewrites the file it is given, so hand it a copy.
+
+`POE_SELFTEST=scroll` drags a long note past the window — plain, with the find
+bar up, and after stepping through matches — and checks that the scroll lands
+where it was pushed, that nothing pulls it back, and that the frames don't each
+pay for a restyle:
+
+```bash
+POE_SELFTEST=scroll POE_SNAPSHOT=/tmp/poe POE_LIBRARY=/tmp/poe-library .build/release/Poe
+```
+
+`POE_LIBRARY` points the library somewhere disposable — worth setting for any of
+these, since a harness that types into notes will otherwise type into yours.
+
+The parts that need no window run without one:
 
 ```bash
 swiftc Sources/Poe/Model/TextFile.swift Sources/Poe/Model/Note.swift \

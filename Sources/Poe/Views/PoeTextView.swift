@@ -163,6 +163,9 @@ struct PoeTextView: NSViewRepresentable {
         /// line under the caret, and this catches up once the keys stop.
         private var pendingRestyle: DispatchWorkItem?
         private weak var scrollView: NSScrollView?
+        /// Set between a scroll moving the view and us answering for it, so a
+        /// flick's worth of bounds changes collapses into one pass.
+        private var catchingUp = false
         /// What the last pass covered, so scrolling within it costs nothing.
         private var styledRange: NSRange?
         /// Where the caret was in each document, so coming back feels like
@@ -260,13 +263,42 @@ struct PoeTextView: NSViewRepresentable {
 
         /// Style what's on screen, plus a margin either side so scrolling never
         /// reveals raw text. Cost stays flat however long the document is.
+        ///
+        /// A restyle isn't free of consequence: a heading that grows from body
+        /// size to 25 point relays out the lines it sits among, and doing that
+        /// under a moving scroll shifts the text the reader is chasing. So it
+        /// happens as rarely as it can — when what's on screen is about to run
+        /// past what's been styled, and then far enough ahead to last a while.
+        /// Scrolling through text already styled costs nothing, which is what
+        /// this always claimed and, until the styled range started sliding
+        /// forward a frame at a time instead of growing, never did.
         func restyleVisible(_ textView: NSTextView, force: Bool) {
             guard parent.styled, let storage = textView.textStorage, storage.length > 0 else { return }
-            let target = visibleRange(of: textView)
-            if !force, let styled = styledRange, NSIntersectionRange(styled, target) == target { return }
+            let needed = visibleRange(of: textView, padding: Self.margin)
+            if !force, let styled = styledRange, NSIntersectionRange(styled, needed) == needed { return }
+            let target = visibleRange(of: textView, padding: Self.reach)
             MarkdownStyle.apply(to: storage, base: Self.attributes(dense: parent.dense), in: target)
-            styledRange = target
+            styledRange = Self.joined(styledRange, target)
             highlightFind(in: textView)
+        }
+
+        /// How far past the window a restyle reaches, and how little of that has
+        /// to be left ahead of the reader before the next one. Between them they
+        /// buy a couple of screenfuls of scrolling per pass.
+        private static let reach = 5_000
+        private static let margin = 1_200
+
+        /// The two ranges as one, when they meet. The styler leaves its work in
+        /// the buffer, so text once styled stays styled and the range can only
+        /// grow. Ranges that don't touch have raw text between them — a search
+        /// that jumped the reader across the document — and only the new one can
+        /// be claimed.
+        private static func joined(_ styled: NSRange?, _ target: NSRange) -> NSRange {
+            guard let styled,
+                  NSMaxRange(styled) >= target.location,
+                  NSMaxRange(target) >= styled.location
+            else { return target }
+            return NSUnionRange(styled, target)
         }
 
         /// Just the paragraph under the caret — what a keystroke can change on
@@ -307,18 +339,33 @@ struct PoeTextView: NSViewRepresentable {
             )
         }
 
+        /// The clip view's bounds moved.
+        ///
+        /// Everything there is to do about that — style what arrived, light the
+        /// matches in it — edits the text the scroll is busy moving, and doing
+        /// that here means doing it *inside* the scroll's own bookkeeping: the
+        /// relayout changes how tall the document is, the clip view answers by
+        /// moving again, and the whole thing lands back in this method. That is
+        /// a scroll that shudders in place instead of travelling. So the work
+        /// waits for the next turn of the run loop, and a flick that posts forty
+        /// bounds changes still only does it once.
         @objc private func didScroll() {
-            guard let textView = scrollView?.documentView as? NSTextView else { return }
-            restyleVisible(textView, force: false)
-            // Not part of the restyle: code and very long documents never reach
-            // it, and their matches still have to light up as they scroll in.
-            // With no search up there is nothing to relight, and this fires on
-            // every frame of every scroll.
-            guard findState.active || !lit.isEmpty else { return }
-            highlightFind(in: textView)
+            guard !catchingUp else { return }
+            catchingUp = true
+            DispatchQueue.main.async { [weak self] in
+                guard let self else { return }
+                self.catchingUp = false
+                guard let textView = self.scrollView?.documentView as? NSTextView else { return }
+                self.restyleVisible(textView, force: false)
+                // Not part of the restyle: code and very long documents never
+                // reach it, and their matches still have to light up as they
+                // scroll in. With no search up there is nothing to relight.
+                guard self.findState.active || !self.lit.isEmpty else { return }
+                self.highlightFind(in: textView)
+            }
         }
 
-        private func visibleRange(of textView: NSTextView) -> NSRange {
+        private func visibleRange(of textView: NSTextView, padding: Int) -> NSRange {
             guard let layoutManager = textView.layoutManager,
                   let container = textView.textContainer,
                   let storage = textView.textStorage else {
@@ -327,8 +374,6 @@ struct PoeTextView: NSViewRepresentable {
             let visible = textView.visibleRect
             let glyphs = layoutManager.glyphRange(forBoundingRect: visible, in: container)
             let characters = layoutManager.characterRange(forGlyphRange: glyphs, actualGlyphRange: nil)
-            // A screenful of slack either side, so scrolling never shows raw text.
-            let padding = 2_500
             let start = max(0, characters.location - padding)
             let end = min(storage.length, NSMaxRange(characters) + padding)
             return NSRange(location: start, length: end - start)
@@ -483,18 +528,19 @@ struct PoeTextView: NSViewRepresentable {
             lit = wanted
         }
 
-        /// Which matches should be lit: the ones on screen, plus the current
-        /// one wherever it is. A document can hold twenty thousand matches, so
-        /// the on-screen run is found by bisection rather than by walking them.
+        /// Which matches should be lit: the ones on screen, and only those. A
+        /// document can hold twenty thousand matches, so the on-screen run is
+        /// found by bisection rather than by walking them.
+        ///
+        /// The current match used to be lit wherever it stood, screens away if
+        /// need be — invisible by definition, and asking TextKit to lay out the
+        /// text between here and there to find out where "there" is. Stepping to
+        /// a match scrolls it into view first, so it is on screen by the time
+        /// this runs and lights up with the rest.
         private func highlights(in textView: NSTextView, length: Int) -> [Highlight] {
             guard findState.active, !findState.matches.isEmpty else { return [] }
             let matches = findState.matches
-            let onScreen = visibleRange(of: textView)
-
-            var found: [Highlight] = []
-            if let current = findState.currentRange, NSMaxRange(current) <= length {
-                found.append(Highlight(range: current, current: true))
-            }
+            let onScreen = visibleRange(of: textView, padding: Self.margin)
 
             // First match that could still reach into the visible range.
             var low = 0, high = matches.count
@@ -503,14 +549,14 @@ struct PoeTextView: NSViewRepresentable {
                 if NSMaxRange(matches[middle].range) <= onScreen.location { low = middle + 1 } else { high = middle }
             }
 
+            var found: [Highlight] = []
             var index = low
             while index < matches.count, matches[index].range.location < NSMaxRange(onScreen) {
                 let range = matches[index].range
                 let ordinal = index + 1
                 index += 1
-                // The current one is already in, wherever it happens to be.
-                guard NSMaxRange(range) <= length, ordinal != findState.current else { continue }
-                found.append(Highlight(range: range, current: false))
+                guard NSMaxRange(range) <= length else { continue }
+                found.append(Highlight(range: range, current: ordinal == findState.current))
             }
             return found
         }

@@ -82,10 +82,16 @@ enum MarkdownStyle {
 
     // MARK: - Entry point
 
+    /// How many restyles have run. Styling relays out the lines it touches, so
+    /// how often it happens is the whole of what a scroll costs — a number a
+    /// test can hold to account.
+    static private(set) var passes = 0
+
     /// Restyle `requested`, widened to whole lines. Only attributes are touched.
     static func apply(to storage: NSTextStorage, base: [NSAttributedString.Key: Any], in requested: NSRange) {
         let text = storage.string as NSString
         guard text.length > 0 else { return }
+        passes += 1
 
         let clamped = NSRange(
             location: min(requested.location, text.length),
