@@ -80,7 +80,7 @@ final class NoteStore: ObservableObject {
 
     @Published var findVisible: Bool = false
     @Published var findQuery: String = "" {
-        didSet { if findQuery != oldValue { refreshFind(reveal: true) } }
+        didSet { if findQuery != oldValue { findQueryChanged() } }
     }
     /// Every match in the open document, in UTF-16 — the units both the editor
     /// and `AttributedString` count in — so nothing has to search twice.
@@ -97,9 +97,9 @@ final class NoteStore: ObservableObject {
 
     var findCount: Int { findMatches.count }
 
-    /// Past this many characters, a document is recounted once the typing
-    /// pauses rather than on every keystroke: a full pass over 8 MB costs an
-    /// eighth of a second, which the writer would feel.
+    /// Past this many bytes, a document is recounted — and a search of it
+    /// re-run — once the typing pauses rather than on every keystroke: a full
+    /// pass over 8 MB costs an eighth of a second, which the writer would feel.
     private static let instantFindLimit = 200_000
     /// And past this many matches we stop collecting. Nothing useful happens
     /// beyond it, and the list itself starts to cost more than the search.
@@ -114,9 +114,15 @@ final class NoteStore: ObservableObject {
     @Published var brokenLinks: Set<UUID> = []
     @Published var message: PoeMessage?
 
-    /// What we last wrote to each linked file, so a save that changes nothing
-    /// doesn't touch the file's modification date.
-    private var lastWritten: [UUID: String] = [:]
+    /// Linked notes carrying words their file hasn't been given yet.
+    ///
+    /// This used to be a copy of what was last written to each file, and a save
+    /// asked whether it still equalled the note — which walks both documents to
+    /// the first difference. A caret resting at the end of an 8 MB file made
+    /// that an 8 MB comparison on the main actor, every 700 ms, per open file,
+    /// and the copies themselves doubled what a large open file cost in memory.
+    /// A note is dirty because it was typed into; that is a set membership.
+    private var unflushed: Set<UUID> = []
     private var saveTask: Task<Void, Never>?
     private var settleTask: Task<Void, Never>?
 
@@ -222,7 +228,7 @@ final class NoteStore: ObservableObject {
     /// disk work happens on `writer`, an actor, so saves also can't overlap
     /// each other. Only a quit waits for it.
     func saveNow() {
-        let pending = pendingLinkedWrites()
+        let pending = claimLinkedWrites()
         guard edits != written || !pending.isEmpty else { return }
         writing = true
         let snapshot = notes
@@ -246,7 +252,7 @@ final class NoteStore: ObservableObject {
     func saveAndWait() {
         saveTask?.cancel()
         saveTask = nil
-        let pending = pendingLinkedWrites()
+        let pending = claimLinkedWrites()
         // Nothing has changed and nothing is in flight: the file on disk is
         // already this library, and a quit needn't rewrite it to say so.
         guard edits != written || writing || !pending.isEmpty else { return }
@@ -257,12 +263,18 @@ final class NoteStore: ObservableObject {
         linkedWrites(finished: pending, failed: outcome.failed)
     }
 
-    /// Which linked notes have text their file hasn't been given yet.
-    private func pendingLinkedWrites() -> [LinkedWrite] {
-        notes.compactMap { note in
-            guard let link = note.file, lastWritten[note.id] != note.text else { return nil }
+    /// Take the linked notes whose files are behind, and consider them handed
+    /// over. A keystroke that lands while the write is in flight marks the note
+    /// again, so nothing typed during a save is lost; a write that fails puts
+    /// it back.
+    private func claimLinkedWrites() -> [LinkedWrite] {
+        guard !unflushed.isEmpty else { return [] }
+        let claimed = notes.compactMap { note -> LinkedWrite? in
+            guard let link = note.file, unflushed.contains(note.id) else { return nil }
             return LinkedWrite(id: note.id, link: link, text: note.text)
         }
+        unflushed.subtract(claimed.map(\.id))
+        return claimed
     }
 
     /// Book-keeping for writes that have landed, back on the main actor.
@@ -270,8 +282,8 @@ final class NoteStore: ObservableObject {
         for write in finished {
             if failed.contains(write.id) {
                 brokenLinks.insert(write.id)
+                unflushed.insert(write.id)
             } else {
-                lastWritten[write.id] = write.text
                 brokenLinks.remove(write.id)
             }
         }
@@ -426,6 +438,7 @@ final class NoteStore: ObservableObject {
 
         notes[index].text = newValue
         notes[index].updated = Date()
+        if notes[index].file != nil { unflushed.insert(notes[index].id) }
         scheduleSave()
 
         // The placeholder under an empty document has to go the moment the
@@ -438,7 +451,9 @@ final class NoteStore: ObservableObject {
 
         // Every match past the edit has shifted; keep the tally honest,
         // but don't yank the view off to one of them.
-        if findVisible { scheduleFindRecount(length: newValue.utf16.count) }
+        // Bytes, not UTF-16 units, which a string has to be walked to count.
+        // They only ever over-estimate, so the threshold still holds.
+        if findVisible { scheduleFindRecount(length: newValue.utf8.count) }
     }
 
     // MARK: - Opening files
@@ -501,7 +516,7 @@ final class NoteStore: ObservableObject {
                 notes[index].updated = loaded.modified
             }
             notes[index].file = loaded.link
-            lastWritten[notes[index].id] = loaded.text
+            unflushed.remove(notes[index].id)
             brokenLinks.remove(notes[index].id)
             libraryChanged()
             return notes[index].id
@@ -514,7 +529,7 @@ final class NoteStore: ObservableObject {
             file: loaded.link
         )
         notes.append(note)
-        lastWritten[note.id] = loaded.text
+        unflushed.remove(note.id)
         libraryChanged()
         return note.id
     }
@@ -571,13 +586,19 @@ final class NoteStore: ObservableObject {
             guard let file = entry else { continue }
 
             if file.text == notes[index].text {
-                lastWritten[id] = file.text
+                unflushed.remove(id)
             } else if file.modified > notes[index].updated {
                 notes[index].text = file.text
                 notes[index].file = file.link
                 notes[index].updated = file.modified
-                lastWritten[id] = file.text
+                unflushed.remove(id)
                 changed = true
+            } else {
+                // The library holds words the file was never given — a crash
+                // between the keystroke and the flush. The next save carries
+                // them across, which is what comparing the two copies used to
+                // work out on its own.
+                unflushed.insert(id)
             }
         }
         if changed { libraryChanged() }
@@ -591,7 +612,7 @@ final class NoteStore: ObservableObject {
             notes[index].text = loaded.text
             notes[index].file = loaded.link
             notes[index].updated = loaded.modified
-            lastWritten[notes[index].id] = loaded.text
+            unflushed.remove(notes[index].id)
             brokenLinks.remove(notes[index].id)
             libraryChanged()
             scheduleSave()
@@ -603,7 +624,7 @@ final class NoteStore: ObservableObject {
     /// Keep the text, drop the tether — the file on disk stops changing.
     func unlinkSelected() {
         guard let index = selectedIndex, notes[index].file != nil else { return }
-        lastWritten[notes[index].id] = nil
+        unflushed.remove(notes[index].id)
         brokenLinks.remove(notes[index].id)
         notes[index].file = nil
         notes[index].updated = Date()
@@ -640,7 +661,7 @@ final class NoteStore: ObservableObject {
         let neighbours = visible
         let row = neighbours.firstIndex { $0.id == id }
         notes.remove(at: index)
-        lastWritten[id] = nil
+        unflushed.remove(id)
         brokenLinks.remove(id)
         libraryChanged()
         if wasSelected {
@@ -807,17 +828,36 @@ final class NoteStore: ObservableObject {
     /// Search whichever text the reader is actually looking at.
     private func matches(in text: String) -> [FindMatch] {
         guard readingRendered else {
-            return Self.ranges(of: findQuery, in: text as NSString)
+            return Self.ranges(of: findQuery, in: text)
                 .map { FindMatch(range: $0, block: nil) }
         }
 
         var found: [FindMatch] = []
         for (index, block) in visibleBlocks(of: text).enumerated() {
             guard found.count < Self.findMatchLimit else { break }
-            found += Self.ranges(of: findQuery, in: block as NSString)
+            found += Self.ranges(of: findQuery, in: block)
                 .map { FindMatch(range: $0, block: index) }
         }
         return found
+    }
+
+    /// A letter typed into the find field.
+    ///
+    /// The same bargain the recount after an edit makes, for the same reason:
+    /// counting is fast but not free, and typing "receive" into a 4 MB document
+    /// asked for seven passes over it where one will do. Emptying the field
+    /// clears the bar at once — nobody should watch stale highlights fade.
+    private func findQueryChanged() {
+        findRecount?.cancel()
+        guard findVisible, !findQuery.isEmpty,
+              let text = selectedNote?.text, text.utf8.count > Self.instantFindLimit
+        else { return refreshFind(reveal: true) }
+
+        findRecount = Task { [weak self] in
+            try? await Task.sleep(nanoseconds: 150_000_000)
+            guard !Task.isCancelled else { return }
+            self?.refreshFind(reveal: true)
+        }
     }
 
     /// Recount after an edit. A note is counted there and then; a document big
@@ -840,8 +880,54 @@ final class NoteStore: ObservableObject {
     }
 
     /// Every occurrence, ignoring case and accents — the same forgiving match
-    /// the sidebar's search uses.
-    private static func ranges(of query: String, in text: NSString) -> [NSRange] {
+    /// the sidebar's search uses, and now by the same two roads.
+    ///
+    /// The sidebar stopped asking Foundation for this because
+    /// `range(of:options:)` manages about 40 MB/s; the find bar was still
+    /// paying it over the whole document for every letter typed into the field.
+    /// An ASCII query in an ASCII document needs none of that machinery — case
+    /// folding is one bit, accent folding is nothing, and a UTF-8 offset *is*
+    /// the UTF-16 offset, so the fast scan can hand back ranges the editor and
+    /// the preview can use unchanged. Anything else goes back to Foundation,
+    /// which is the only thing that knows what "café" folds onto.
+    private static func ranges(of query: String, in text: String) -> [NSRange] {
+        if let needle = Note.asciiFolded(query), let found = asciiRanges(of: needle, in: text) {
+            return found
+        }
+        return foundationRanges(of: query, in: text as NSString)
+    }
+
+    /// Where an ASCII needle sits in plain ASCII text, or nil the moment the
+    /// text turns out not to be plain: past a high byte the offsets stop
+    /// meaning UTF-16, and what folds onto what stops being ours to say.
+    private static func asciiRanges(of needle: [UInt8], in text: String) -> [NSRange]? {
+        let scanned: [NSRange]?? = text.utf8.withContiguousStorageIfAvailable { haystack in
+            var found: [NSRange] = []
+            var index = 0
+            let count = haystack.count
+            let last = count - needle.count
+            while index < count, found.count < findMatchLimit {
+                let byte = haystack[index]
+                if byte >= 0x80 { return nil }
+                if index <= last, Note.fold(byte) == needle[0] {
+                    var offset = 1
+                    while offset < needle.count, Note.fold(haystack[index + offset]) == needle[offset] {
+                        offset += 1
+                    }
+                    if offset == needle.count {
+                        found.append(NSRange(location: index, length: needle.count))
+                        index += needle.count
+                        continue
+                    }
+                }
+                index += 1
+            }
+            return found
+        }
+        return scanned ?? nil
+    }
+
+    private static func foundationRanges(of query: String, in text: NSString) -> [NSRange] {
         var found: [NSRange] = []
         var start = 0
         let options: NSString.CompareOptions = [.caseInsensitive, .diacriticInsensitive]
@@ -890,7 +976,7 @@ final class NoteStore: ObservableObject {
         do {
             try TextFile.write(note.text, to: link)
             notes[index].file = link
-            lastWritten[notes[index].id] = notes[index].text
+            unflushed.remove(notes[index].id)
             brokenLinks.remove(notes[index].id)
             libraryChanged()
             scheduleSave()

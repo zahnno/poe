@@ -221,12 +221,14 @@ struct Note: Identifiable, Codable, Equatable {
         return outcome.plain ? false : text.range(of: query, options: searchOptions) != nil
     }
 
-    private static func fold(_ byte: UInt8) -> UInt8 {
+    /// Shared with the find bar, which searches one document the same way
+    /// the sidebar searches the library.
+    static func fold(_ byte: UInt8) -> UInt8 {
         (byte >= 0x41 && byte <= 0x5A) ? byte | 0x20 : byte
     }
 
     /// The query as lowercase ASCII bytes, or nil if it isn't plain ASCII.
-    private static func asciiFolded(_ query: String) -> [UInt8]? {
+    static func asciiFolded(_ query: String) -> [UInt8]? {
         var bytes: [UInt8] = []
         bytes.reserveCapacity(query.utf8.count)
         for byte in query.utf8 {

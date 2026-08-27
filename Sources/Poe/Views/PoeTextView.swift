@@ -182,6 +182,13 @@ struct PoeTextView: NSViewRepresentable {
         /// on to the string that went in means the usual answer costs a pointer
         /// comparison: Swift compares identical string buffers by identity.
         private var knownText = ""
+        /// True when the edit about to be published has already been spliced
+        /// into `knownText`. A change that arrived some other way — or one the
+        /// splice couldn't place — reads the whole buffer back instead.
+        private var patched = false
+        /// Set while we are putting a whole new document in: the storage
+        /// delegate must not try to splice a replacement it didn't cause.
+        private var replacing = false
 
         struct Highlight: Equatable {
             var range: NSRange
@@ -195,8 +202,11 @@ struct PoeTextView: NSViewRepresentable {
 
         /// Put a whole new document in the buffer, remembering what it was.
         func replace(_ textView: NSTextView, with text: String) {
+            replacing = true
             textView.string = text
+            replacing = false
             knownText = text
+            patched = false
             lit = []
         }
 
@@ -335,6 +345,41 @@ struct PoeTextView: NSViewRepresentable {
         ) {
             guard editedMask.contains(.editedCharacters) else { return }
             MarkdownStyle.invalidate(from: editedRange.location)
+            guard !replacing else { return }
+            patched = splice(editedRange, delta: delta, of: textStorage)
+        }
+
+        /// Carry the edit that just landed into `knownText`, instead of reading
+        /// the whole document back out of the buffer.
+        ///
+        /// The storage hands over the range the edit now occupies and how much
+        /// longer it made the document, which between them say exactly what was
+        /// replaced: `editedRange.length - delta` characters in the same place.
+        /// So a keystroke splices in a keystroke. It used to bridge, copy and
+        /// validate the entire document per character — half a millisecond on a
+        /// 40 KB note, and the largest single cost of typing into a big file.
+        ///
+        /// False if the edit can't be placed — a buffer we've lost track of, or
+        /// a range that doesn't land on a character boundary — and the caller
+        /// falls back to reading it whole.
+        private func splice(_ edited: NSRange, delta: Int, of storage: NSTextStorage) -> Bool {
+            let replaced = edited.length - delta
+            guard edited.location >= 0, edited.length >= 0, replaced >= 0,
+                  NSMaxRange(edited) <= storage.length,
+                  // What we hold has to *be* what the buffer held a moment ago,
+                  // or the range below would splice into the wrong document.
+                  storage.length - delta == knownText.utf16.count,
+                  let range = Range(NSRange(location: edited.location, length: replaced), in: knownText)
+            else { return false }
+
+            // Small inserts — every keystroke — arrive as Swift's own compact
+            // string form and need no conversion; a paste is bulk-converted
+            // once, here, rather than a character at a time downstream.
+            let inserted = edited.length == 0
+                ? ""
+                : Self.native((storage.string as NSString).substring(with: edited))
+            knownText.replaceSubrange(range, with: inserted)
+            return true
         }
 
         /// Esc closes the find bar from the editor too, the way it does from the
@@ -346,12 +391,13 @@ struct PoeTextView: NSViewRepresentable {
 
         func textDidChange(_ notification: Notification) {
             guard let textView = notification.object as? NSTextView else { return }
-            // Read out of the storage once. The very same string then goes to
-            // the store and stays here, so the update that comes back knows
-            // itself on sight.
-            let text = Self.native(textView)
-            knownText = text
-            parent.onEdit(text)
+            // The storage delegate has already carried the edit across; only a
+            // change it couldn't place sends us back to the whole document. The
+            // very same string then goes to the store and stays here, so the
+            // update that comes back knows itself on sight.
+            if !patched { knownText = Self.native(textView) }
+            patched = false
+            parent.onEdit(knownText)
             restyleCaretParagraph(in: textView)
             scheduleRestyle(of: textView)
         }
@@ -370,7 +416,10 @@ struct PoeTextView: NSViewRepresentable {
         /// buys all of that back for as long as the note is in memory: this is
         /// the string the store keeps, so nothing downstream ever pays again.
         static func native(_ textView: NSTextView) -> String {
-            let text = textView.string
+            native(textView.string)
+        }
+
+        static func native(_ text: String) -> String {
             if text.isContiguousUTF8 { return text }
             // Through `Data` rather than `makeContiguousUTF8()`, which walks the
             // text character by character and costs ten times as much, and
