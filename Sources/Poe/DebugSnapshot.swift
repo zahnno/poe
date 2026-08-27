@@ -30,8 +30,48 @@ enum DebugSnapshot {
 
         // POE_SELFTEST=bench types into a full library and times each keystroke,
         // window update included.
+        // POE_SELFTEST=live runs the app for real and measures CPU, not wall time.
+        // POE_SELFTEST=drift captures the window twice, ten seconds apart, so a
+        // test can tell a background that is drifting from one that has stopped.
+        if scenario == "drift" {
+            var first: [CGPoint] = []
+            after(4.0) {
+                guard let view = findDriftView() else { print("SELFTEST: no drift view"); return }
+                check("the background is drifting", view.isDrifting)
+                first = view.driftPhase
+                // A layout pass must not put the drift back to its beginning.
+                view.needsLayout = true
+                view.layoutSubtreeIfNeeded()
+                check("laying out again left the drift running", view.isDrifting)
+                print("SELFTEST: drift at 4s  \(first.map { "(\(Int($0.x)),\(Int($0.y)))" }.joined(separator: " "))")
+            }
+            after(14.0) {
+                guard let view = findDriftView() else { print("SELFTEST: no drift view"); return }
+                let second = view.driftPhase
+                print("SELFTEST: drift at 14s \(second.map { "(\(Int($0.x)),\(Int($0.y)))" }.joined(separator: " "))")
+                let moved = zip(first, second).contains { abs($0.x - $1.x) > 1 || abs($0.y - $1.y) > 1 }
+                check("the orbs moved over ten seconds", moved)
+                print("SELFTEST: \(failures) failed check(s)")
+                NSApp.terminate(nil)
+            }
+            return
+        }
+
+        if scenario == "live" {
+            LiveBench.run()
+            return
+        }
+
         if scenario == "bench" {
             benchFlow()
+            return
+        }
+
+        // POE_SELFTEST=fence edits a fenced document everywhere a writer could,
+        // with POE_FENCE_VERIFY on, to prove the styler's running fence count
+        // says what a full rescan would have said.
+        if scenario == "fence" {
+            fenceFlow()
             return
         }
 
@@ -327,6 +367,86 @@ enum DebugSnapshot {
         poll(seconds)
     }
 
+    /// Does the incremental fence count agree with counting from scratch?
+    ///
+    /// The count above the caret is kept between keystrokes and only thrown away
+    /// when an edit lands above where it was taken. That is a claim about every
+    /// way text can reach the buffer, so this makes every one of them: typing at
+    /// the top, the middle and the end, deleting, replacing a selection, pasting
+    /// a fence in, undoing it, and swapping the document out from under it.
+    private static func fenceFlow() {
+        let store = NoteStore.shared
+
+        let document = """
+        Title
+
+        Prose before any code at all.
+
+        ```
+        let a = 1
+        ```
+
+        Between the blocks.
+
+        ~~~
+        tilde fenced
+        ~~~
+
+        After both.
+
+        ```swift
+        unterminated fence opens here
+        """
+
+        after(1.5) {
+            store.newNote()
+            store.currentText.wrappedValue = document
+        }
+
+        after(3.0) {
+            guard let textView = findTextView() else {
+                print("SELFTEST: no editor"); NSApp.terminate(nil); return
+            }
+            textView.window?.makeFirstResponder(textView)
+            check("verification is on", MarkdownStyle.verifying)
+
+            let length = { (textView.string as NSString).length }
+
+            // An edit at every offset in the document, top to bottom and back.
+            for offset in stride(from: 0, to: length(), by: 7) {
+                textView.setSelectedRange(NSRange(location: min(offset, length()), length: 0))
+                textView.insertText("x", replacementRange: textView.selectedRange())
+            }
+            for offset in stride(from: length() - 1, through: 0, by: -11) {
+                textView.setSelectedRange(NSRange(location: max(offset, 0), length: 1))
+                textView.insertText("", replacementRange: textView.selectedRange())
+            }
+
+            // Fences arriving and leaving whole, above text already counted.
+            for _ in 0..<12 {
+                textView.setSelectedRange(NSRange(location: 0, length: 0))
+                textView.insertText("```\nsudden fence\n```\n", replacementRange: textView.selectedRange())
+                textView.setSelectedRange(NSRange(location: 30, length: 0))
+                textView.insertText("tail", replacementRange: textView.selectedRange())
+                textView.undoManager?.undo()
+                textView.undoManager?.undo()
+            }
+
+            // A selection replaced across a fence, then the whole document swapped.
+            textView.setSelectedRange(NSRange(location: 0, length: min(60, length())))
+            textView.insertText("replaced\n```\n", replacementRange: textView.selectedRange())
+            store.newNote()
+            store.currentText.wrappedValue = document + "\n```\nand more\n```\n"
+
+            check("fence count never disagreed with a full rescan", MarkdownStyle.mismatches == 0)
+            if MarkdownStyle.mismatches > 0 {
+                print("SELFTEST: \(MarkdownStyle.mismatches) mismatch(es)")
+            }
+            print("SELFTEST: \(failures) failed check(s)")
+            NSApp.terminate(nil)
+        }
+    }
+
     /// What one keystroke costs, end to end.
     ///
     /// Builds a library of the size someone actually keeps, opens a long note
@@ -363,9 +483,9 @@ enum DebugSnapshot {
             textView.setSelectedRange(NSRange(location: (textView.string as NSString).length, length: 0))
 
             @MainActor func settle() {
-                view.layoutSubtreeIfNeeded()
-                CATransaction.flush()
-                view.displayIfNeeded()
+                PoePerf.measure("  settle.layout") { view.layoutSubtreeIfNeeded() }
+                PoePerf.measure("  settle.flush") { CATransaction.flush() }
+                PoePerf.measure("  settle.display") { view.displayIfNeeded() }
             }
 
             // Warm the caches the first keystroke would otherwise pay for.
@@ -374,12 +494,18 @@ enum DebugSnapshot {
                 settle()
             }
 
+            PoePerf.enabled = ProcessInfo.processInfo.environment["POE_BENCH_PERF"] != nil
+            PoePerf.reset()
             var samples: [Double] = []
             for _ in 0..<strokes {
                 let started = CFAbsoluteTimeGetCurrent()
                 textView.insertText("a", replacementRange: textView.selectedRange())
+                let inserted = CFAbsoluteTimeGetCurrent()
                 settle()
-                samples.append((CFAbsoluteTimeGetCurrent() - started) * 1000)
+                let done = CFAbsoluteTimeGetCurrent()
+                PoePerf.record("insertText (total)", inserted - started)
+                PoePerf.record("settle (SwiftUI+draw)", done - inserted)
+                samples.append((done - started) * 1000)
             }
             samples.sort()
             let mean = samples.reduce(0, +) / Double(samples.count)
@@ -388,6 +514,7 @@ enum DebugSnapshot {
                 notes + 1, size / 1000, mean,
                 samples[samples.count / 2], samples[Int(Double(samples.count) * 0.95)], samples[samples.count - 1]
             ))
+            PoePerf.report(over: strokes)
             NSApp.terminate(nil)
         }
     }
@@ -448,6 +575,20 @@ enum DebugSnapshot {
             .max { $0.frame.width * $0.frame.height < $1.frame.width * $1.frame.height }
     }
 
+    private static func findDriftView() -> DriftView? {
+        func search(_ view: NSView) -> DriftView? {
+            if let found = view as? DriftView { return found }
+            for subview in view.subviews {
+                if let found = search(subview) { return found }
+            }
+            return nil
+        }
+        for window in NSApp.windows where window.isVisible {
+            if let root = window.contentView, let found = search(root) { return found }
+        }
+        return nil
+    }
+
     private static func findTextView() -> NSTextView? {
         for window in NSApp.windows {
             if let view = window.contentView, let found = search(view) { return found }
@@ -505,5 +646,43 @@ enum DebugSnapshot {
             }
         }
         print("SELFTEST: '\(title)' not found")
+    }
+}
+
+/// Where a keystroke's time actually goes.
+///
+/// Off unless the bench asks for it, and then only a pair of `CFAbsoluteTime`
+/// reads per span — cheap enough not to change what it is measuring.
+enum PoePerf {
+    static var enabled = false
+    private static var totals: [String: (seconds: Double, count: Int)] = [:]
+
+    @inline(__always)
+    static func measure<T>(_ label: String, _ body: () -> T) -> T {
+        guard enabled else { return body() }
+        let started = CFAbsoluteTimeGetCurrent()
+        defer { record(label, CFAbsoluteTimeGetCurrent() - started) }
+        return body()
+    }
+
+    static func record(_ label: String, _ seconds: Double) {
+        guard enabled else { return }
+        var entry = totals[label] ?? (0, 0)
+        entry.seconds += seconds
+        entry.count += 1
+        totals[label] = entry
+    }
+
+    static func reset() { totals = [:] }
+
+    static func report(over strokes: Int) {
+        guard enabled else { return }
+        for (label, entry) in totals.sorted(by: { $0.value.seconds > $1.value.seconds }) {
+            print(String(
+                format: "PERF  %-26s %8.3f ms/stroke  (%d calls, %.3f ms each)",
+                (label as NSString).utf8String!, entry.seconds * 1000 / Double(strokes),
+                entry.count, entry.seconds * 1000 / Double(entry.count)
+            ))
+        }
     }
 }

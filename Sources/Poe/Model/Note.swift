@@ -98,20 +98,61 @@ struct Note: Identifiable, Codable, Equatable {
         return true
     }
 
-    /// Counted, not split: the old version allocated a substring per word.
-    var wordCount: Int {
-        var count = 0
-        var inWord = false
-        for byte in text.utf8 {
-            if byte == 0x20 || byte == 0x0A || byte == 0x09 || byte == 0x0D {
-                inWord = false
-            } else if !inWord {
-                inWord = true
-                count += 1
-            }
-        }
-        return count
+    /// Words, lines and characters, in one pass.
+    ///
+    /// Each of these used to walk the whole document on its own, and the status
+    /// bar wants all three at once — three passes over every byte, a few times a
+    /// second, for as long as the typing goes on. They come out of a single scan
+    /// instead.
+    ///
+    /// The character count is the one that has to be careful. `String.count`
+    /// counts grapheme clusters, which is what a writer means by a character and
+    /// what the status bar has always shown — but for ASCII a grapheme is a byte,
+    /// with one exception: `\r\n` is two bytes and one character. So the scan
+    /// counts those pairs, and only text with something non-ASCII in it is handed
+    /// back to `String.count`, which is the only thing that knows the answer.
+    struct Counts: Equatable {
+        var words = 0
+        var characters = 0
+        var lines = 0
     }
+
+    var counts: Counts {
+        var words = 0
+        var newlines = 0
+        var bytes = 0
+        var crlf = 0
+        var inWord = false
+        var ascii = true
+        var previous: UInt8 = 0
+
+        for byte in text.utf8 {
+            bytes += 1
+            if byte >= 0x80 { ascii = false }
+            switch byte {
+            case 0x20, 0x09, 0x0D:
+                inWord = false
+            case 0x0A:
+                inWord = false
+                newlines += 1
+                if previous == 0x0D { crlf += 1 }
+            default:
+                if !inWord {
+                    inWord = true
+                    words += 1
+                }
+            }
+            previous = byte
+        }
+
+        return Counts(
+            words: words,
+            characters: bytes == 0 ? 0 : (ascii ? bytes - crlf : text.count),
+            lines: bytes == 0 ? 0 : newlines + 1
+        )
+    }
+
+    var wordCount: Int { counts.words }
 
     var kind: FileKind {
         // A note with no file behind it is markdown by convention.
@@ -126,14 +167,7 @@ struct Note: Identifiable, Codable, Equatable {
         return ext.isEmpty ? "TEXT" : ext.uppercased()
     }
 
-    /// Likewise counted rather than `components(separatedBy:)`, which built an
-    /// array holding a second copy of the entire document.
-    var lineCount: Int {
-        guard !text.isEmpty else { return 0 }
-        var count = 1
-        for byte in text.utf8 where byte == 0x0A { count += 1 }
-        return count
-    }
+    var lineCount: Int { counts.lines }
 
     func matches(_ query: String) -> Bool {
         guard !query.isEmpty else { return true }

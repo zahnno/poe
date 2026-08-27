@@ -120,6 +120,15 @@ final class NoteStore: ObservableObject {
     private var saveTask: Task<Void, Never>?
     private var settleTask: Task<Void, Never>?
 
+    /// How far the library has moved, and how much of that the disk has been
+    /// told about. Every save used to re-encode and rewrite the whole library
+    /// whether or not a word had changed — so ⌘S on an untouched library, and
+    /// the save at every quit, each rewrote a megabyte of JSON to say nothing.
+    private var edits = 0
+    private var written = 0
+    /// True between handing a snapshot to the writer and hearing back.
+    private var writing = false
+
     /// The sifted, sorted library, and the counts under the editor. Both are
     /// derived from every note's text, and both used to be recomputed several
     /// times per redraw — `visible` twice in one pass of the sidebar's body.
@@ -139,6 +148,7 @@ final class NoteStore: ObservableObject {
     func libraryChanged() {
         settleTask?.cancel()
         settleTask = nil
+        reindex()
         libraryVersion &+= 1
     }
 
@@ -195,6 +205,7 @@ final class NoteStore: ObservableObject {
 
     /// Coalesces rapid edits into a single write.
     func scheduleSave() {
+        edits &+= 1
         saveTask?.cancel()
         saveTask = Task { [weak self] in
             try? await Task.sleep(nanoseconds: 700_000_000)
@@ -212,11 +223,19 @@ final class NoteStore: ObservableObject {
     /// each other. Only a quit waits for it.
     func saveNow() {
         let pending = pendingLinkedWrites()
+        guard edits != written || !pending.isEmpty else { return }
+        writing = true
         let snapshot = notes
+        let version = edits
         let writer = Self.writer
         Task { [weak self] in
-            let failed = await writer.save(snapshot, linked: pending)
-            self?.linkedWrites(finished: pending, failed: failed)
+            let outcome = await writer.save(snapshot, linked: pending)
+            self?.writing = false
+            // Only a write that landed counts as told. A save that failed —
+            // a full disk, a revoked permission — leaves the library looking
+            // unsaved, so the next one tries again instead of assuming.
+            if outcome.saved { self?.written = version }
+            self?.linkedWrites(finished: pending, failed: outcome.failed)
         }
     }
 
@@ -228,10 +247,14 @@ final class NoteStore: ObservableObject {
         saveTask?.cancel()
         saveTask = nil
         let pending = pendingLinkedWrites()
-        let failed = Writer.perform(notes, linked: pending)
+        // Nothing has changed and nothing is in flight: the file on disk is
+        // already this library, and a quit needn't rewrite it to say so.
+        guard edits != written || writing || !pending.isEmpty else { return }
+        let outcome = Writer.perform(notes, linked: pending)
+        if outcome.saved { written = edits }
         // Same book-keeping the async path does — a file that has just been
         // written is no longer a broken link, whichever way the write got there.
-        linkedWrites(finished: pending, failed: failed)
+        linkedWrites(finished: pending, failed: outcome.failed)
     }
 
     /// Which linked notes have text their file hasn't been given yet.
@@ -260,16 +283,23 @@ final class NoteStore: ObservableObject {
         var text: String
     }
 
+    /// Which linked files refused the write, and whether the library itself
+    /// reached the disk.
+    struct Written: Sendable {
+        var failed: Set<UUID> = []
+        var saved = false
+    }
+
     /// Everything that touches the disk, serialized and off the main thread.
     private actor Writer {
-        func save(_ snapshot: [Note], linked: [LinkedWrite]) -> Set<UUID> {
+        func save(_ snapshot: [Note], linked: [LinkedWrite]) -> Written {
             Self.perform(snapshot, linked: linked)
         }
 
-        nonisolated static func perform(_ snapshot: [Note], linked: [LinkedWrite]) -> Set<UUID> {
-            var failed: Set<UUID> = []
+        nonisolated static func perform(_ snapshot: [Note], linked: [LinkedWrite]) -> Written {
+            var outcome = Written()
             for write in linked {
-                do { try TextFile.write(write.text, to: write.link) } catch { failed.insert(write.id) }
+                do { try TextFile.write(write.text, to: write.link) } catch { outcome.failed.insert(write.id) }
             }
 
             let encoder = JSONEncoder()
@@ -277,10 +307,13 @@ final class NoteStore: ObservableObject {
             // Sorted keys keep the file diffable; pretty-printing only made it
             // bigger and slower to write, and nobody reads it by hand.
             encoder.outputFormatting = [.sortedKeys]
-            guard let data = try? encoder.encode(snapshot) else { return failed }
+            guard let data = try? encoder.encode(snapshot) else { return outcome }
             try? FileManager.default.createDirectory(at: NoteStore.directory, withIntermediateDirectories: true)
-            try? data.write(to: NoteStore.fileURL, options: .atomic)
-            return failed
+            do {
+                try data.write(to: NoteStore.fileURL, options: .atomic)
+                outcome.saved = true
+            } catch {}
+            return outcome
         }
 
         /// Read every linked file, so the main actor can decide what to adopt
@@ -319,37 +352,53 @@ final class NoteStore: ObservableObject {
         return notes
     }
 
-    /// Words, characters and lines under the editor — three passes over the
-    /// whole document, so they are counted once per settled change rather than
-    /// once per redraw.
-    struct Stats: Equatable {
-        var words = 0
-        var characters = 0
-        var lines = 0
-    }
+    /// Words, characters and lines under the editor — one pass over the whole
+    /// document, taken once per settled change rather than once per redraw.
+    typealias Stats = Note.Counts
 
     var stats: Stats {
         if let cached = cachedStats, cached.version == libraryVersion, cached.id == selection {
             return cached.stats
         }
-        let note = selectedNote
-        let stats = Stats(
-            words: note?.wordCount ?? 0,
-            characters: note?.text.count ?? 0,
-            lines: note?.lineCount ?? 0
-        )
+        let stats = selectedNote?.counts ?? Stats()
         cachedStats = (libraryVersion, selection, stats)
         return stats
     }
 
+    /// Where each note sits in `notes`.
+    ///
+    /// Finding the open note used to be a walk of the library, and the window
+    /// asks for it constantly — the toolbar, the status bar, the editor's text,
+    /// and every keystroke on its way to the store. At two hundred notes that
+    /// walk cost most of a millisecond per keystroke on its own.
+    private var index: [UUID: Int] = [:]
+
+    private func reindex() {
+        index.removeAll(keepingCapacity: true)
+        index.reserveCapacity(notes.count)
+        for position in notes.indices { index[notes[position].id] = position }
+    }
+
+    /// Where `id` sits, by lookup — falling back to a walk if the map has gone
+    /// stale, so a mutation that forgets to announce itself is a slow answer
+    /// rather than a wrong one.
+    func position(of id: UUID) -> Int? {
+        if let position = index[id], position < notes.count, notes[position].id == id {
+            return position
+        }
+        guard let found = notes.firstIndex(where: { $0.id == id }) else { return nil }
+        reindex()
+        return found
+    }
+
     var selectedNote: Note? {
-        guard let selection else { return nil }
-        return notes.first { $0.id == selection }
+        guard let index = selectedIndex else { return nil }
+        return notes[index]
     }
 
     var selectedIndex: Int? {
         guard let selection else { return nil }
-        return notes.firstIndex { $0.id == selection }
+        return position(of: selection)
     }
 
     var canPreview: Bool {
@@ -586,18 +635,18 @@ final class NoteStore: ObservableObject {
     }
 
     func delete(_ id: UUID) {
-        guard let index = notes.firstIndex(where: { $0.id == id }) else { return }
+        guard let index = position(of: id) else { return }
         let wasSelected = selection == id
         let neighbours = visible
-        let position = neighbours.firstIndex { $0.id == id }
+        let row = neighbours.firstIndex { $0.id == id }
         notes.remove(at: index)
         lastWritten[id] = nil
         brokenLinks.remove(id)
         libraryChanged()
         if wasSelected {
             let remaining = visible
-            if let position, !remaining.isEmpty {
-                selection = remaining[min(position, remaining.count - 1)].id
+            if let row, !remaining.isEmpty {
+                selection = remaining[min(row, remaining.count - 1)].id
             } else {
                 selection = remaining.first?.id
             }
@@ -628,7 +677,7 @@ final class NoteStore: ObservableObject {
     }
 
     func togglePin(_ id: UUID) {
-        guard let index = notes.firstIndex(where: { $0.id == id }) else { return }
+        guard let index = position(of: id) else { return }
         notes[index].pinned.toggle()
         libraryChanged()
         scheduleSave()

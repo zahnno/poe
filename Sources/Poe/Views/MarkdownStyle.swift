@@ -113,20 +113,69 @@ enum MarkdownStyle {
         storage.endEditing()
     }
 
+    /// How many fences stood above a point, and which buffer that was counted in.
+    ///
+    /// `upTo` is always the start of a line, which is the only place the caller
+    /// ever asks about, and so the only place an incremental count can resume
+    /// from safely.
+    private static var counted: (buffer: ObjectIdentifier?, upTo: Int, fences: Int) = (nil, 0, 0)
+
+    /// Cross-checks the running count against a full rescan on every query.
+    ///
+    /// Set by the self test and nothing else — it makes the whole point of the
+    /// running count moot, and exists so a test can prove the two agree over an
+    /// edit at every position a writer could put one.
+    static let verifying = ProcessInfo.processInfo.environment["POE_FENCE_VERIFY"] != nil
+    static private(set) var mismatches = 0
+
+    /// An edit landed at `location`. A count taken from below it still stands;
+    /// one taken from above it was counted over text that has since changed.
+    ///
+    /// Called for every character edit in the buffer, so the invariant holds
+    /// however the text got there — typed, pasted, undone, or replaced wholesale.
+    static func invalidate(from location: Int) {
+        if location < counted.upTo { counted = (nil, 0, 0) }
+    }
+
     /// Count the fences above a point: an odd number means we start inside code.
     ///
-    /// This runs on every keystroke, over everything above the caret, so it
-    /// copies those code units out once and walks them as raw `UInt16` —
-    /// eight times quicker than handing the same prefix to the regex engine,
-    /// and thirty times quicker than reading it back through `NSString` a
-    /// character at a time.
+    /// This runs on every keystroke, and used to read everything above the caret
+    /// each time — the one part of a restyle whose cost grew with the length of
+    /// the document rather than with the size of the edit. It doesn't need to.
+    /// Typing never alters the text above the caret's own paragraph, so the
+    /// count above it cannot have changed either: it is taken once, extended a
+    /// line at a time as the caret moves down the document, and thrown away the
+    /// moment an edit lands at or above where it was taken from.
     private static func isFenced(before location: Int, in text: NSString) -> Bool {
         guard location > 0 else { return false }
-        if scratch.count < location {
-            scratch = [unichar](repeating: 0, count: max(location, 8_192))
+
+        var start = 0
+        var fences = 0
+        if counted.buffer == ObjectIdentifier(text), counted.upTo <= location, counted.upTo <= text.length {
+            start = counted.upTo
+            fences = counted.fences
+        }
+        if start < location {
+            fences += fenceLines(in: text, from: start, to: location)
+        }
+        counted = (ObjectIdentifier(text), location, fences)
+        if verifying, fences != fenceLines(in: text, from: 0, to: location) { mismatches += 1 }
+        return fences % 2 == 1
+    }
+
+    /// The fence lines in `[start, end)`, which both have to be line starts.
+    ///
+    /// Copies those code units out once and walks them as raw `UInt16` — eight
+    /// times quicker than handing the same text to the regex engine, and thirty
+    /// times quicker than reading it back through `NSString` a character at a time.
+    private static func fenceLines(in text: NSString, from start: Int, to end: Int) -> Int {
+        let length = end - start
+        guard length > 0 else { return 0 }
+        if scratch.count < length {
+            scratch = [unichar](repeating: 0, count: max(length, 8_192))
         }
         scratch.withUnsafeMutableBufferPointer { buffer in
-            text.getCharacters(buffer.baseAddress!, range: NSRange(location: 0, length: location))
+            text.getCharacters(buffer.baseAddress!, range: NSRange(location: start, length: length))
         }
 
         let space = unit(" "), tab = unit("\t"), newline = unit("\n")
@@ -134,22 +183,22 @@ enum MarkdownStyle {
         var fences = 0
         scratch.withUnsafeBufferPointer { buffer in
             var index = 0
-            while index < location {
+            while index < length {
                 // Past the line's indent, if that is where a fence begins.
                 var scan = index
-                while scan < location, buffer[scan] == space || buffer[scan] == tab { scan += 1 }
-                if scan + 2 < location {
+                while scan < length, buffer[scan] == space || buffer[scan] == tab { scan += 1 }
+                if scan + 2 < length {
                     let character = buffer[scan]
                     if character == backtick || character == tilde,
                        buffer[scan + 1] == character, buffer[scan + 2] == character {
                         fences += 1
                     }
                 }
-                while index < location, buffer[index] != newline { index += 1 }
+                while index < length, buffer[index] != newline { index += 1 }
                 index += 1
             }
         }
-        return fences % 2 == 1
+        return fences
     }
 
     /// Reused between keystrokes so the scan above doesn't allocate.

@@ -103,6 +103,10 @@ struct PoeTextView: NSViewRepresentable {
         textView.usesFindBar = true
         textView.isIncrementalSearchingEnabled = true
 
+        // Every character edit, however it got there, so the markdown styler's
+        // running fence count can tell what it still knows from what it doesn't.
+        textView.textStorage?.delegate = context.coordinator
+
         context.coordinator.apply(to: textView)
         context.coordinator.watchScrolling(of: scrollView)
         EditorTextView.register(textView)
@@ -151,7 +155,7 @@ struct PoeTextView: NSViewRepresentable {
         context.coordinator.updateFind(in: textView, to: find)
     }
 
-    final class Coordinator: NSObject, NSTextViewDelegate {
+    final class Coordinator: NSObject, NSTextViewDelegate, NSTextStorageDelegate {
         var parent: PoeTextView
         var focusToken: Int
         var documentID: UUID?
@@ -320,6 +324,19 @@ struct PoeTextView: NSViewRepresentable {
             return NSRange(location: start, length: end - start)
         }
 
+        /// Text changed in the buffer — typed, pasted, undone, or replaced whole.
+        /// Attribute-only edits are the styler's own work and change nothing it
+        /// has counted.
+        func textStorage(
+            _ textStorage: NSTextStorage,
+            didProcessEditing editedMask: NSTextStorageEditActions,
+            range editedRange: NSRange,
+            changeInLength delta: Int
+        ) {
+            guard editedMask.contains(.editedCharacters) else { return }
+            MarkdownStyle.invalidate(from: editedRange.location)
+        }
+
         /// Esc closes the find bar from the editor too, the way it does from the
         /// field itself — the writer shouldn't have to reach back for it.
         func textView(_ textView: NSTextView, doCommandBy selector: Selector) -> Bool {
@@ -332,11 +349,39 @@ struct PoeTextView: NSViewRepresentable {
             // Read out of the storage once. The very same string then goes to
             // the store and stays here, so the update that comes back knows
             // itself on sight.
-            let text = textView.string
+            let text = Self.native(textView)
             knownText = text
             parent.onEdit(text)
             restyleCaretParagraph(in: textView)
             scheduleRestyle(of: textView)
+        }
+
+        /// The buffer's text, as a string Swift can actually read.
+        ///
+        /// `NSTextView.string` hands back a *lazily bridged* `NSString`. It
+        /// arrives instantly — and then every byte anyone asks of it is fetched
+        /// one character at a time through Objective-C. On a 40 KB note that
+        /// makes `utf8.count` cost 0.2 ms, the byte scanners in `Note` run 13×
+        /// slower than they read, and `withContiguousStorageIfAvailable` — which
+        /// the library search leans on for its fast path — quietly returns nil,
+        /// so that path never runs at all.
+        ///
+        /// Converting it here, once, in bulk, costs about half a millisecond and
+        /// buys all of that back for as long as the note is in memory: this is
+        /// the string the store keeps, so nothing downstream ever pays again.
+        static func native(_ textView: NSTextView) -> String {
+            let text = textView.string
+            if text.isContiguousUTF8 { return text }
+            // Through `Data` rather than `makeContiguousUTF8()`, which walks the
+            // text character by character and costs ten times as much, and
+            // rather than `utf8String`, which stops at the first NUL.
+            if let data = (text as NSString).data(using: String.Encoding.utf8.rawValue),
+               let converted = String(data: data, encoding: .utf8) {
+                return converted
+            }
+            var fallback = text
+            fallback.makeContiguousUTF8()
+            return fallback
         }
 
         // MARK: - Find

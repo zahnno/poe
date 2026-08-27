@@ -2,9 +2,10 @@ import SwiftUI
 
 /// A light-touch markdown renderer.
 ///
-/// Block structure (headings, bullets, quotes, fenced code, rules) is handled
-/// line by line here; inline spans are handed to `AttributedString`'s own
-/// markdown parser so links, bold, italic and code all come for free.
+/// Block structure (headings, bullets, quotes, fenced code, rules) is worked
+/// out here, a line at a time, though consecutive prose lines gather into one
+/// paragraph; inline spans are handed to `AttributedString`'s own markdown
+/// parser so links, bold, italic and code all come for free.
 struct MarkdownPreview: View {
     let text: String
     /// What ⌘F found, in the words the reader can see rather than the ones the
@@ -97,8 +98,8 @@ struct MarkdownPreview: View {
         return blocks
     }
 
-    /// Inline markdown, parsed once per distinct line rather than once per
-    /// line per redraw — `AttributedString(markdown:)` is a real parser, and
+    /// Inline markdown, parsed once per distinct block rather than once per
+    /// block per redraw — `AttributedString(markdown:)` is a real parser, and
     /// scrolling the preview was running it over every visible block on every
     /// frame.
     private static var inlineCache: [String: AttributedString] = [:]
@@ -107,11 +108,34 @@ struct MarkdownPreview: View {
         var result: [Block] = []
         var codeLines: [String] = []
         var inCode = false
+        /// The prose lines gathered so far, which become one block rather than
+        /// one each. A `Text` is the whole of a selection in SwiftUI — you can
+        /// drag within one and never across two — so a paragraph split over a
+        /// view per line is a paragraph the reader can't select and copy. It's
+        /// also what markdown means: a hard-wrapped paragraph reflows.
+        var prose: [String] = []
+        /// Whether the line just gathered asked for a break of its own: two
+        /// trailing spaces, markdown's hard break, which the trim below would
+        /// otherwise eat.
+        var breaks: [Bool] = []
+
+        func flushProse() {
+            guard !prose.isEmpty else { return }
+            var joined = prose[0]
+            for index in 1..<prose.count {
+                joined += breaks[index - 1] ? "\n" : " "
+                joined += prose[index]
+            }
+            result.append(.paragraph(joined))
+            prose = []
+            breaks = []
+        }
 
         for raw in text.components(separatedBy: "\n") {
             let line = raw.trimmingCharacters(in: .whitespaces)
 
             if line.hasPrefix("```") {
+                flushProse()
                 if inCode {
                     result.append(.code(codeLines.joined(separator: "\n")))
                     codeLines = []
@@ -125,20 +149,27 @@ struct MarkdownPreview: View {
             }
 
             if line.isEmpty {
+                flushProse()
                 result.append(.blank)
             } else if line.hasPrefix("#") {
+                flushProse()
                 let level = min(line.prefix(while: { $0 == "#" }).count, 3)
                 result.append(.heading(String(line.dropFirst(level)).trimmingCharacters(in: .whitespaces), level))
             } else if line == "---" || line == "***" || line == "___" {
+                flushProse()
                 result.append(.rule)
             } else if line.hasPrefix("> ") {
+                flushProse()
                 result.append(.quote(String(line.dropFirst(2))))
             } else if line.hasPrefix("- ") || line.hasPrefix("* ") || line.hasPrefix("+ ") {
+                flushProse()
                 result.append(.bullet(String(line.dropFirst(2))))
             } else {
-                result.append(.paragraph(line))
+                prose.append(line)
+                breaks.append(raw.hasSuffix("  "))
             }
         }
+        flushProse()
         if inCode, !codeLines.isEmpty {
             result.append(.code(codeLines.joined(separator: "\n")))
         }
