@@ -1,5 +1,0 @@
-Poe: a native macOS notepad that saves itself and styles your markdown as you write.
-
-Named for the Zelda ghosts — the ones you only ever see as a lantern in the dark. Which is what a note is: a light you leave for the you who comes back lost.
-
-github.com/zahnno/poe
