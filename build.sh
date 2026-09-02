@@ -38,7 +38,7 @@ codesign --force --sign - --timestamp=none "$APP" >/dev/null 2>&1 || true
 echo "✓ Built $APP"
 
 if [ "$RELAUNCH" -eq 1 ]; then
-    echo "→ Launching $APP…"
+    echo "→ Launching $APP..."
     pkill -x Poe 2>/dev/null || true
     open "$APP"
 else

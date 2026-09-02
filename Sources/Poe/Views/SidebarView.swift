@@ -55,6 +55,13 @@ struct SidebarView: View {
 
                 Divider()
 
+                Toggle("Show Gradients", isOn: Binding(
+                    get: { themeManager.gradientsEnabled },
+                    set: { themeManager.gradientsEnabled = $0 }
+                ))
+
+                Divider()
+
                 ForEach(ThemeCategory.allCases) { category in
                     Menu(category.rawValue) {
                         ForEach(Theme.themes(in: category)) { theme in

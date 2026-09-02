@@ -19,22 +19,28 @@ struct AuroraBackground: View {
             Theme.void
                 .animation(.easeInOut(duration: 0.25), value: themeManager.currentTheme.id)
 
-            Drift(theme: themeManager.currentTheme)
-                .allowsHitTesting(false)
+            if themeManager.gradientsEnabled {
+                Drift(theme: themeManager.currentTheme)
+                    .allowsHitTesting(false)
+                    .transition(.opacity)
 
-            // A faint grid, barely there — just enough to read as "instrument panel".
-            GridVeil(isLight: themeManager.currentTheme.isLight)
-                .opacity(themeManager.currentTheme.isLight ? 0.18 : 0.35)
+                // A faint grid, barely there — just enough to read as "instrument panel".
+                GridVeil(isLight: themeManager.currentTheme.isLight)
+                    .opacity(themeManager.currentTheme.isLight ? 0.18 : 0.35)
+                    .transition(.opacity)
 
-            // Pull everything back toward dark or light so text always wins.
-            LinearGradient(
-                colors: themeManager.currentTheme.isLight
-                    ? [Color.white.opacity(0.12), Color.white.opacity(0.35)]
-                    : [Color.black.opacity(0.30), Color.black.opacity(0.62)],
-                startPoint: .top,
-                endPoint: .bottom
-            )
+                // Pull everything back toward dark or light so text always wins.
+                LinearGradient(
+                    colors: themeManager.currentTheme.isLight
+                        ? [Color.white.opacity(0.12), Color.white.opacity(0.35)]
+                        : [Color.black.opacity(0.30), Color.black.opacity(0.62)],
+                    startPoint: .top,
+                    endPoint: .bottom
+                )
+                .transition(.opacity)
+            }
         }
+        .animation(.easeInOut(duration: 0.25), value: themeManager.gradientsEnabled)
         .ignoresSafeArea()
     }
 }

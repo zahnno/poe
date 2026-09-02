@@ -83,6 +83,14 @@ struct PoeApp: App {
 
             Divider()
 
+            Toggle("Show Gradients", isOn: Binding(
+                get: { ThemeManager.shared.gradientsEnabled },
+                set: { ThemeManager.shared.gradientsEnabled = $0 }
+            ))
+            .keyboardShortcut("g", modifiers: [.command, .option])
+
+            Divider()
+
             ForEach(ThemeCategory.allCases) { category in
                 Menu(category.rawValue) {
                     ForEach(Theme.themes(in: category)) { theme in

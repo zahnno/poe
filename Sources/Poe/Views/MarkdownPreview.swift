@@ -62,7 +62,7 @@ struct MarkdownPreview: View {
             .padding(.vertical, 30)
             .textSelection(.enabled)
         }
-        .scrollIndicators(.never)
+        .scrollIndicators(.visible)
     }
 
     private var blockOfCurrentMatch: Int? {

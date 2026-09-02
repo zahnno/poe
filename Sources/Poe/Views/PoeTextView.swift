@@ -70,9 +70,10 @@ struct PoeTextView: NSViewRepresentable {
         scrollView.drawsBackground = false
         scrollView.borderType = .noBorder
         scrollView.hasVerticalScroller = true
+        scrollView.hasHorizontalScroller = false
         scrollView.scrollerStyle = .overlay
-        scrollView.autohidesScrollers = true
-        scrollView.verticalScroller?.alphaValue = 0.35
+        scrollView.autohidesScrollers = false
+        scrollView.scrollerKnobStyle = ThemeManager.shared.currentTheme.isLight ? .dark : .light
 
         guard let textView = scrollView.documentView as? NSTextView else { return scrollView }
 
@@ -119,6 +120,7 @@ struct PoeTextView: NSViewRepresentable {
         context.coordinator.parent = self
 
         textView.isContinuousSpellCheckingEnabled = styled
+        scrollView.scrollerKnobStyle = ThemeManager.shared.currentTheme.isLight ? .dark : .light
 
         if context.coordinator.themeID != themeID {
             context.coordinator.themeID = themeID

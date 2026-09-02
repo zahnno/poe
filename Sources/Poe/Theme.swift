@@ -985,9 +985,24 @@ final class ThemeManager: ObservableObject {
         }
     }
 
+    @Published var gradientsEnabled: Bool {
+        didSet {
+            UserDefaults.standard.set(gradientsEnabled, forKey: "poe.gradientsEnabled")
+        }
+    }
+
     private init() {
         let savedId = UserDefaults.standard.string(forKey: "poe.activeThemeId") ?? "abyss"
         self.currentTheme = Theme.allThemes.first { $0.id == savedId } ?? Theme.allThemes[0]
+        if UserDefaults.standard.object(forKey: "poe.gradientsEnabled") != nil {
+            self.gradientsEnabled = UserDefaults.standard.bool(forKey: "poe.gradientsEnabled")
+        } else {
+            self.gradientsEnabled = true
+        }
+    }
+
+    func toggleGradients() {
+        gradientsEnabled.toggle()
     }
 
     func setTheme(_ id: String) {
@@ -1051,12 +1066,20 @@ enum Theme {
     static var frame: Color { current.frame }
     static var frameDeep: Color { current.frameDeep }
 
-    static var glow: LinearGradient {
-        LinearGradient(
-            colors: [current.accent, current.accentDeep, current.violet],
-            startPoint: .topLeading,
-            endPoint: .bottomTrailing
-        )
+    static var gradientsEnabled: Bool {
+        ThemeManager.shared.gradientsEnabled
+    }
+
+    static var glow: AnyShapeStyle {
+        if ThemeManager.shared.gradientsEnabled {
+            return AnyShapeStyle(LinearGradient(
+                colors: [current.accent, current.accentDeep, current.violet],
+                startPoint: .topLeading,
+                endPoint: .bottomTrailing
+            ))
+        } else {
+            return AnyShapeStyle(current.accent)
+        }
     }
 
     static let editorFont = NSFont(name: "SF Mono", size: 15)
