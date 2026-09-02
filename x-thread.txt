@@ -1,0 +1,28 @@
+════ 1/5 ════  (attach assets/demo.mp4 to this one)
+
+Poe — a native macOS notepad. Dark, glassy, keyboard-first, and it saves itself.
+
+Markdown styles itself as you write. Open any text file and edit it in place. Nothing you type ever leaves the machine.
+
+════ 2/5 ════
+
+The name is a Zelda reference.
+
+Poes are the ghosts that drift through the dark carrying a lantern. In Twilight Princess you can't even see the ghost — just the light it's holding, bobbing somewhere ahead of you.
+
+════ 3/5 ════
+
+Which is what a note actually is.
+
+You don't write one for yourself now. You write it for the version of you who turns up later, lost, in the dark. The note isn't the thing you needed — it's the lantern you left burning so you can find your way back to it.
+
+════ 4/5 ════
+
+So the whole app is built around not losing the light: it saves itself 0.7s after you stop typing, every file it opens stays a real file on disk, and there's no account, no sync, no network call anywhere in it.
+
+════ 5/5 ════
+
+One Swift package, zero dependencies. Your notes live in one plain JSON file in ~/Library/Application Support/Poe — readable, greppable, yours.
+
+Build it in about a minute:
+github.com/zahnno/poe

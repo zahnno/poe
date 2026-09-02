@@ -3,6 +3,7 @@ import UniformTypeIdentifiers
 
 struct RootView: View {
     @EnvironmentObject var store: NoteStore
+    @ObservedObject private var themeManager = ThemeManager.shared
     @State private var dropTargeted = false
 
     var body: some View {
@@ -28,7 +29,7 @@ struct RootView: View {
             if dropTargeted { dropOverlay }
         }
         .frame(minWidth: 720, minHeight: 480)
-        .preferredColorScheme(.dark)
+        .preferredColorScheme(themeManager.currentTheme.isLight ? .light : .dark)
         .tint(Theme.accent)
         .onDrop(of: [.fileURL], isTargeted: $dropTargeted.animation(.easeOut(duration: 0.15))) { providers in
             open(providers)

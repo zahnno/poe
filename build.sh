@@ -6,6 +6,15 @@ cd "$(dirname "$0")"
 ROOT="$(pwd)"
 APP="$ROOT/build/Poe.app"
 
+RELAUNCH=0
+for arg in "$@"; do
+    case "$arg" in
+        --run|--relaunch|-r)
+            RELAUNCH=1
+            ;;
+    esac
+done
+
 echo "→ Compiling (release)…"
 swift build -c release
 
@@ -27,5 +36,12 @@ echo "→ Signing (ad-hoc)…"
 codesign --force --sign - --timestamp=none "$APP" >/dev/null 2>&1 || true
 
 echo "✓ Built $APP"
-echo "  open \"$APP\"        # run it"
-echo "  cp -R \"$APP\" /Applications/   # install it"
+
+if [ "$RELAUNCH" -eq 1 ]; then
+    echo "→ Launching $APP…"
+    pkill -x Poe 2>/dev/null || true
+    open "$APP"
+else
+    echo "  open \"$APP\"        # run it"
+    echo "  cp -R \"$APP\" /Applications/   # install it"
+fi

@@ -3,6 +3,7 @@ import SwiftUI
 
 struct EditorView: View {
     @EnvironmentObject var store: NoteStore
+    @ObservedObject private var themeManager = ThemeManager.shared
 
     private var note: Note? { store.selectedNote }
     private var linkBroken: Bool {
@@ -93,6 +94,22 @@ struct EditorView: View {
             Menu {
                 Button("Open File…") { store.openFromPanel() }
                 Divider()
+                Menu("Theme (\(themeManager.currentTheme.name))") {
+                    Button("Next Theme") { themeManager.nextTheme() }
+                    Button("Previous Theme") { themeManager.previousTheme() }
+                    Button("Random Theme") { themeManager.randomTheme() }
+                    Divider()
+                    ForEach(ThemeCategory.allCases) { category in
+                        Menu(category.rawValue) {
+                            ForEach(Theme.themes(in: category)) { theme in
+                                Button(theme.name) {
+                                    themeManager.setTheme(theme.id)
+                                }
+                            }
+                        }
+                    }
+                }
+                Divider()
                 Button("Duplicate as Note") { store.duplicateSelected() }
                 Button("Copy Text") { store.copySelectedToPasteboard() }
                 Button("Save As…") { store.saveSelectedAs() }
@@ -160,6 +177,7 @@ struct EditorView: View {
                     current: store.findIndex,
                     revealToken: store.findRevealToken
                 ),
+                themeID: themeManager.currentTheme.id,
                 onEscape: { [store] in
                     guard store.findVisible else { return false }
                     store.hideFind()

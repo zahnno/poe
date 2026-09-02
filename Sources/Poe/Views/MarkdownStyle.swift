@@ -44,14 +44,14 @@ enum MarkdownStyle {
         rounded(15, weight: .medium)
     ]
 
-    private static let ink = NSColor(Theme.ink)
-    private static let inkDim = NSColor(Theme.inkDim)
-    private static let accent = NSColor(Theme.accent)
-    private static let violet = NSColor(Theme.violet)
+    private static var ink: NSColor { NSColor(Theme.ink) }
+    private static var inkDim: NSColor { NSColor(Theme.inkDim) }
+    private static var accent: NSColor { NSColor(Theme.accent) }
+    private static var violet: NSColor { NSColor(Theme.violet) }
     /// Markers recede but never vanish — you can always see what you're editing.
-    private static let marker = NSColor(Theme.inkFaint).withAlphaComponent(0.55)
-    private static let codeInk = NSColor(Theme.accent).withAlphaComponent(0.92)
-    private static let codeBackground = NSColor.white.withAlphaComponent(0.05)
+    private static var marker: NSColor { NSColor(Theme.inkFaint).withAlphaComponent(0.55) }
+    private static var codeInk: NSColor { NSColor(Theme.accent).withAlphaComponent(0.92) }
+    private static var codeBackground: NSColor { NSColor(Theme.codePanel) }
 
     // Spelled out with types: a heterogeneous dictionary literal that also has to
     // infer a ternary or an integer literal takes the type checker *minutes*.

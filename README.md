@@ -70,6 +70,24 @@ cp -R build/Poe.app /Applications/
 That's the whole install. Poe keeps its notes in
 `~/Library/Application Support/Poe/`, writes nothing else, and phones nowhere.
 
+---
+
+## 🤖 Hacking Poe with AI Agents
+
+Because Poe has **zero external dependencies** and compiles in seconds, it is built to be customized on the fly by local AI agents (e.g. [Privateer](https://github.com/earendil-works/pi), Claude Code, Cursor, Aider).
+
+You can clone the repo and ask your agent in plain English:
+
+```bash
+# Using Privateer (pi)
+pi "change the aurora background to deep emerald and amber, and add a live word counter"
+```
+
+The repo includes:
+* **`AGENTS.md`** — An architectural map for AI coding agents.
+* **`.pi/skills/hack.md`** — A ready-made workflow for Privateer to edit, test (`swift build`), and live-relaunch (`./build.sh --run`) the app in seconds.
+* **`./build.sh --run`** — Compiles and immediately hot-relaunches your custom build without losing open notes.
+
 <details>
 <summary><b>Building a universal binary (Apple silicon + Intel)</b></summary>
 

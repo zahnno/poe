@@ -31,6 +31,7 @@ struct PoeTextView: NSViewRepresentable {
     /// What the find bar found. The store does the searching — it holds the
     /// text — and the editor only lights the matches and scrolls to one.
     var find: FindState = FindState()
+    var themeID: String = ""
     /// Esc with the find bar up. Returns true if there was a bar to close.
     var onEscape: () -> Bool = { false }
 
@@ -119,7 +120,12 @@ struct PoeTextView: NSViewRepresentable {
 
         textView.isContinuousSpellCheckingEnabled = styled
 
-        if context.coordinator.documentID != documentID {
+        if context.coordinator.themeID != themeID {
+            context.coordinator.themeID = themeID
+            textView.insertionPointColor = NSColor(Theme.accent)
+            textView.textColor = NSColor(Theme.ink)
+            context.coordinator.apply(to: textView)
+        } else if context.coordinator.documentID != documentID {
             // A different document. The text view is shared, so everything it was
             // holding for the last one — half-typed input, an undo stack that
             // would splice the old words into this file — has to go with it.
@@ -159,6 +165,7 @@ struct PoeTextView: NSViewRepresentable {
         var parent: PoeTextView
         var focusToken: Int
         var documentID: UUID?
+        var themeID: String = ""
         /// A full restyle is cheap but not free; typing only ever restyles the
         /// line under the caret, and this catches up once the keys stop.
         private var pendingRestyle: DispatchWorkItem?

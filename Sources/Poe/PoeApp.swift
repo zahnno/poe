@@ -73,6 +73,27 @@ struct PoeApp: App {
             Divider()
         }
 
+        CommandMenu("Theme") {
+            Button("Next Theme") { ThemeManager.shared.nextTheme() }
+                .keyboardShortcut("]", modifiers: [.command, .option])
+            Button("Previous Theme") { ThemeManager.shared.previousTheme() }
+                .keyboardShortcut("[", modifiers: [.command, .option])
+            Button("Random Theme") { ThemeManager.shared.randomTheme() }
+                .keyboardShortcut("t", modifiers: [.command, .option])
+
+            Divider()
+
+            ForEach(ThemeCategory.allCases) { category in
+                Menu(category.rawValue) {
+                    ForEach(Theme.themes(in: category)) { theme in
+                        Button(theme.name) {
+                            ThemeManager.shared.setTheme(theme.id)
+                        }
+                    }
+                }
+            }
+        }
+
         // ⌘F belongs to the document you're reading, the way it does in every
         // other editor; the library's own search keeps the sidebar and moves to
         // ⇧⌘F. Replacing the group takes AppKit's own Find submenu — and its
@@ -113,7 +134,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 window.titlebarAppearsTransparent = true
                 window.isMovableByWindowBackground = true
                 window.backgroundColor = NSColor(Theme.void)
-                window.appearance = NSAppearance(named: .darkAqua)
+                window.appearance = Theme.current.isLight ? NSAppearance(named: .aqua) : NSAppearance(named: .darkAqua)
             }
         }
     }

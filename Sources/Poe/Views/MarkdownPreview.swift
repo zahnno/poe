@@ -7,6 +7,7 @@ import SwiftUI
 /// paragraph; inline spans are handed to `AttributedString`'s own markdown
 /// parser so links, bold, italic and code all come for free.
 struct MarkdownPreview: View {
+    @ObservedObject private var themeManager = ThemeManager.shared
     let text: String
     /// What ⌘F found, in the words the reader can see rather than the ones the
     /// file is written in — the store searched `visibleBlocks(of:)` for these.

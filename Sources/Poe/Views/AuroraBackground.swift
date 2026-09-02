@@ -12,20 +12,25 @@ import SwiftUI
 /// composited from then on rather than being rebuilt sixty times a second in
 /// order to look exactly as they already did.
 struct AuroraBackground: View {
+    @ObservedObject private var themeManager = ThemeManager.shared
+
     var body: some View {
         ZStack {
             Theme.void
+                .animation(.easeInOut(duration: 0.25), value: themeManager.currentTheme.id)
 
-            Drift()
+            Drift(theme: themeManager.currentTheme)
                 .allowsHitTesting(false)
 
             // A faint grid, barely there — just enough to read as "instrument panel".
-            GridVeil()
-                .opacity(0.35)
+            GridVeil(isLight: themeManager.currentTheme.isLight)
+                .opacity(themeManager.currentTheme.isLight ? 0.18 : 0.35)
 
-            // Pull everything back toward black so text always wins.
+            // Pull everything back toward dark or light so text always wins.
             LinearGradient(
-                colors: [Color.black.opacity(0.30), Color.black.opacity(0.62)],
+                colors: themeManager.currentTheme.isLight
+                    ? [Color.white.opacity(0.12), Color.white.opacity(0.35)]
+                    : [Color.black.opacity(0.30), Color.black.opacity(0.62)],
                 startPoint: .top,
                 endPoint: .bottom
             )
@@ -35,46 +40,22 @@ struct AuroraBackground: View {
 }
 
 /// The drift, handed to Core Animation.
-///
-/// It used to be a SwiftUI `repeatForever` on four offsets, which sounds free
-/// and isn't: SwiftUI evaluates a running animation on the main thread on every
-/// frame, forever, whether or not there is anything else to do. An idle Poe
-/// spent most of its time interpolating four numbers nobody was watching.
-/// Core Animation runs the same drift in the render server, so once the
-/// animation is committed the app itself does no per-frame work at all.
-///
-/// It also pauses honestly. Stopping a SwiftUI animation means putting its
-/// state back, which snaps the orbs to where they started; freezing a layer
-/// tree leaves them exactly where they are. So the drift can stop whenever
-/// nobody is looking — the window covered, or Poe simply not the app in front —
-/// and nothing jumps when it picks up again.
 private struct Drift: NSViewRepresentable {
-    func makeNSView(context: Context) -> DriftView { DriftView() }
-    func updateNSView(_ view: DriftView, context: Context) {}
+    var theme: ThemeDefinition
+
+    func makeNSView(context: Context) -> DriftView {
+        let view = DriftView()
+        view.configure(with: theme)
+        return view
+    }
+
+    func updateNSView(_ view: DriftView, context: Context) {
+        view.configure(with: theme)
+    }
 }
 
 final class DriftView: NSView {
-
-    /// Where an orb sits at each end of its drift, in SwiftUI's terms: offsets
-    /// from the centre of the window, y counting downward.
-    private struct Orb {
-        var color: Color
-        var size: CGFloat
-        var alpha: CGFloat
-        var from: CGPoint
-        var to: CGPoint
-    }
-
-    private static let orbs: [Orb] = [
-        Orb(color: Theme.accentDeep, size: 700, alpha: 0.55,
-            from: CGPoint(x: -260, y: -140), to: CGPoint(x: -180, y: -220)),
-        Orb(color: Theme.violet, size: 620, alpha: 0.45,
-            from: CGPoint(x: 180, y: -180), to: CGPoint(x: 260, y: -60)),
-        Orb(color: Theme.accent, size: 540, alpha: 0.30,
-            from: CGPoint(x: 160, y: 200), to: CGPoint(x: 40, y: 280)),
-        Orb(color: Theme.rose, size: 460, alpha: 0.22,
-            from: CGPoint(x: -180, y: 320), to: CGPoint(x: -280, y: 260))
-    ]
+    private var theme: ThemeDefinition = Theme.current
 
     /// A gaussian-ish falloff, in stops. The tail matters more than the middle:
     /// it is what stops the circle reading as a circle. The opacity each orb
@@ -135,17 +116,34 @@ final class DriftView: NSView {
 
     // MARK: - The orbs
 
+    func configure(with newTheme: ThemeDefinition) {
+        self.theme = newTheme
+        guard layer != nil, bounds.width > 0, bounds.height > 0 else { return }
+
+        if orbLayers.count == newTheme.orbs.count && !orbLayers.isEmpty {
+            CATransaction.begin()
+            CATransaction.setAnimationDuration(0.35)
+            for (index, orb) in newTheme.orbs.enumerated() {
+                orbLayers[index].colors = Self.stops.map {
+                    NSColor(orb.color).withAlphaComponent($0.opacity * orb.alpha).cgColor
+                }
+            }
+            CATransaction.commit()
+        } else {
+            rebuild()
+        }
+    }
+
     private func rebuild() {
         guard let host = layer, bounds.width > 0, bounds.height > 0 else { return }
+        let orbs = theme.orbs
 
-        if orbLayers.count != Self.orbs.count {
+        if orbLayers.count != orbs.count {
             orbLayers.forEach { $0.removeFromSuperlayer() }
-            orbLayers = Self.orbs.map { orb in
+            orbLayers = orbs.map { orb in
                 let gradient = CAGradientLayer()
                 gradient.type = .radial
                 gradient.startPoint = CGPoint(x: 0.5, y: 0.5)
-                // For a radial gradient this corner is the extent of the ellipse:
-                // half the layer either way, which is the orb's own radius.
                 gradient.endPoint = CGPoint(x: 1, y: 1)
                 gradient.locations = Self.stops.map { NSNumber(value: Double($0.location)) }
                 gradient.colors = Self.stops.map {
@@ -161,15 +159,10 @@ final class DriftView: NSView {
         // Laying out mustn't animate, and mustn't be seen to restart the drift.
         CATransaction.begin()
         CATransaction.setDisableActions(true)
-        for (index, orb) in Self.orbs.enumerated() {
+        for (index, orb) in orbs.enumerated() {
             let gradient = orbLayers[index]
             gradient.bounds = CGRect(x: 0, y: 0, width: orb.size, height: orb.size)
             gradient.position = CGPoint(x: bounds.midX, y: bounds.midY)
-            // Only ever added once. The drift is written as an offset from
-            // wherever the orb sits rather than as two absolute points, so
-            // resizing the window moves the orb without the animation noticing
-            // — re-adding it here would restart its phase, and every layout
-            // pass would jerk the background back to where it began.
             if gradient.animation(forKey: Self.driftKey) == nil {
                 gradient.add(Self.drift(for: orb), forKey: Self.driftKey)
             }
@@ -179,12 +172,9 @@ final class DriftView: NSView {
 
     private static let driftKey = "drift"
 
-    private static func drift(for orb: Orb) -> CABasicAnimation {
+    private static func drift(for orb: ThemeOrb) -> CABasicAnimation {
         let drift = CABasicAnimation(keyPath: "position")
-        // Added to the orb's position rather than replacing it — see above.
         drift.isAdditive = true
-        // AppKit counts y upward and SwiftUI counts it down, so the offsets the
-        // design was written in are negated on the way through.
         drift.fromValue = NSValue(point: CGPoint(x: orb.from.x, y: -orb.from.y))
         drift.toValue = NSValue(point: CGPoint(x: orb.to.x, y: -orb.to.y))
         drift.duration = period
@@ -196,10 +186,6 @@ final class DriftView: NSView {
 
     // MARK: - Only while someone is looking
 
-    /// Covered, minimised, another app full-screen over the top — or simply not
-    /// the app in front. A drift this slow is imperceptible frame to frame, so
-    /// nobody sees it stop, and stopping it is the difference between a notepad
-    /// that idles at nothing and one that idles at a twentieth of a core.
     @objc private func watchingChanged() {
         let watched = NSApp.occlusionState.contains(.visible)
             && NSApp.isActive
@@ -224,15 +210,9 @@ final class DriftView: NSView {
 }
 
 /// A 44pt hairline grid that fades out toward the bottom of the window.
-///
-/// The fade used to be a `.mask()`, which is an offscreen render of the whole
-/// window: the grid drawn into one buffer, a gradient into another, the two
-/// multiplied and composited back. This paints the same picture directly — the
-/// verticals take the gradient as their stroke, and each horizontal is drawn at
-/// the one opacity the mask would have given it.
 private struct GridVeil: View {
-    /// White at the top, nearly gone by halfway, gone at the bottom — the stops
-    /// the mask gradient used, and the curve `fade(at:)` reads back off them.
+    var isLight: Bool = false
+
     private static let stops: [(location: CGFloat, opacity: CGFloat)] = [
         (0.0, 1.0), (0.5, 0.15), (1.0, 0.0)
     ]
@@ -251,7 +231,8 @@ private struct GridVeil: View {
     var body: some View {
         Canvas { context, size in
             let step: CGFloat = 44
-            let ink: CGFloat = 0.035
+            let ink: CGFloat = isLight ? 0.05 : 0.035
+            let lineColor: Color = isLight ? .black : .white
 
             var verticals = Path()
             var x: CGFloat = 0
@@ -264,7 +245,7 @@ private struct GridVeil: View {
                 verticals,
                 with: .linearGradient(
                     Gradient(stops: Self.stops.map {
-                        .init(color: .white.opacity(ink * $0.opacity), location: $0.location)
+                        .init(color: lineColor.opacity(ink * $0.opacity), location: $0.location)
                     }),
                     startPoint: CGPoint(x: 0, y: 0),
                     endPoint: CGPoint(x: 0, y: size.height)
@@ -275,12 +256,11 @@ private struct GridVeil: View {
             var y: CGFloat = 0
             while y <= size.height {
                 let opacity = ink * Self.fade(at: size.height > 0 ? y / size.height : 0)
-                // The lowest of them would land on nothing anyway.
                 if opacity > 0.0005 {
                     var line = Path()
                     line.move(to: CGPoint(x: 0, y: y))
                     line.addLine(to: CGPoint(x: size.width, y: y))
-                    context.stroke(line, with: .color(.white.opacity(opacity)), lineWidth: 0.5)
+                    context.stroke(line, with: .color(lineColor.opacity(opacity)), lineWidth: 0.5)
                 }
                 y += step
             }

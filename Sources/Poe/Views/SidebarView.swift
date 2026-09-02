@@ -2,6 +2,7 @@ import SwiftUI
 
 struct SidebarView: View {
     @EnvironmentObject var store: NoteStore
+    @ObservedObject private var themeManager = ThemeManager.shared
     @FocusState private var searchFocused: Bool
     @Namespace private var highlight
 
@@ -42,6 +43,43 @@ struct SidebarView: View {
                 .kerning(1.5)
 
             Spacer()
+
+            Menu {
+                Section("Active: \(themeManager.currentTheme.name)") {
+                    Button("Next Theme") { themeManager.nextTheme() }
+                        .keyboardShortcut("]", modifiers: [.command, .option])
+                    Button("Previous Theme") { themeManager.previousTheme() }
+                        .keyboardShortcut("[", modifiers: [.command, .option])
+                    Button("Random Theme") { themeManager.randomTheme() }
+                }
+
+                Divider()
+
+                ForEach(ThemeCategory.allCases) { category in
+                    Menu(category.rawValue) {
+                        ForEach(Theme.themes(in: category)) { theme in
+                            Button {
+                                themeManager.setTheme(theme.id)
+                            } label: {
+                                if theme.id == themeManager.currentTheme.id {
+                                    Text("✓ \(theme.name)")
+                                } else {
+                                    Text(theme.name)
+                                }
+                            }
+                        }
+                    }
+                }
+            } label: {
+                Image(systemName: "paintpalette")
+                    .font(.system(size: 11, weight: .medium))
+                    .foregroundStyle(Theme.inkFaint)
+                    .padding(5)
+                    .background(Circle().fill(Color.white.opacity(0.06)))
+            }
+            .menuStyle(.borderlessButton)
+            .menuIndicator(.hidden)
+            .help("Themes (⌥⌘[ / ⌥⌘])")
 
             Text("\(store.notes.count)")
                 .font(.system(size: 11, weight: .semibold, design: .rounded))
