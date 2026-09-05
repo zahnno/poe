@@ -33,9 +33,19 @@ struct PoeApp: App {
                 .keyboardShortcut("s", modifiers: [.command, .shift])
             Button("Reload from Disk") { store.reloadSelectedFromDisk() }
                 .keyboardShortcut("r", modifiers: .command)
+            Button("Export to Folder…") { store.export(store.actionTargets) }
+                .keyboardShortcut("e", modifiers: [.command, .shift])
         }
 
         CommandMenu("Note") {
+            // Each of these acts on the sidebar's selection when there is one,
+            // and on the open note when there isn't — so the menu bar and the
+            // list never disagree about what "the note" means.
+            Button("Select All Notes") { store.markAll() }
+                .keyboardShortcut("a", modifiers: [.command, .shift])
+            Button("Deselect Notes") { store.clearMarks() }
+                .keyboardShortcut("a", modifiers: [.command, .option])
+            Divider()
             Button("Pin / Unpin") { store.togglePinSelected() }
                 .keyboardShortcut("d", modifiers: .command)
             Button("Duplicate") { store.duplicateSelected() }
@@ -49,6 +59,8 @@ struct PoeApp: App {
                 .keyboardShortcut(.downArrow, modifiers: [.command, .option])
             Button("Previous Note") { store.step(-1) }
                 .keyboardShortcut(.upArrow, modifiers: [.command, .option])
+            Divider()
+            Button("Copy Text") { store.copySelectedToPasteboard() }
             Divider()
             Button("Delete Note") { store.deleteSelected() }
                 .keyboardShortcut(.delete, modifiers: .command)

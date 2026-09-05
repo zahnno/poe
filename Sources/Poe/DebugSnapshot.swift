@@ -64,6 +64,13 @@ enum DebugSnapshot {
             return
         }
 
+        // POE_SELFTEST=select ticks several notes in the sidebar and puts the
+        // bulk actions through their paces.
+        if scenario == "select" {
+            selectFlow(base: base)
+            return
+        }
+
         if scenario == "live" {
             LiveBench.run()
             return
@@ -464,6 +471,110 @@ enum DebugSnapshot {
                     }
                 }
             }
+        }
+    }
+
+    /// Multi-selection end to end: tick a run of notes, pin them, duplicate
+    /// them, and delete them — checking after each that the sweep acted on
+    /// every note it claimed to and on none that it didn't.
+    private static func selectFlow(base: String) {
+        let store = NoteStore.shared
+
+        after(1.5) {
+            // A library with enough in it that a range means something.
+            for index in 1...6 {
+                store.currentText.wrappedValue = "Note \(index)\n\nBody of note \(index)."
+                store.newNote()
+            }
+            store.clearMarks()
+            state("seeded")
+        }
+
+        after(2.5) {
+            let list = store.visible
+            check("six notes to choose from", list.count >= 6)
+            // A plain click, then a shift-click three rows down: four notes.
+            store.choose(list[1].id)
+            store.extendMark(to: list[4].id)
+            check("a shift-click takes the whole run", store.marked.count == 4)
+            check("the run starts where the plain click did", store.marked.contains(list[1].id))
+            check("the run ends where the shift-click did", store.marked.contains(list[4].id))
+            check("the run doesn't reach past its ends",
+                  !store.marked.contains(list[0].id) && !store.marked.contains(list[5].id))
+            // Shift-clicking again re-measures from the same anchor rather than
+            // adding to what's already there.
+            store.extendMark(to: list[2].id)
+            check("a second shift-click re-measures from the anchor", store.marked.count == 2)
+            store.extendMark(to: list[4].id)
+        }
+
+        after(3.2) {
+            let list = store.visible
+            // Command-click adds one note on its own.
+            store.toggleMark(list[0].id)
+            check("a command-click adds one note", store.marked.count == 5)
+            store.toggleMark(list[0].id)
+            check("a second command-click takes it away again", store.marked.count == 4)
+            // Ticking notes still moves the editor to the last one clicked.
+            eventually("the editor follows the last click") {
+                findTextView()?.string == store.selectedNote?.text
+            }
+        }
+
+        after(3.9) { capture(to: base + "-selected.png") }
+
+        after(4.0) {
+            let targets = store.markedNotes
+            check("the sweep is listed in the sidebar's own order",
+                  targets.map(\.id) == store.visible.filter { store.marked.contains($0.id) }.map(\.id))
+            store.togglePin(targets)
+            check("pinning takes the whole sweep",
+                  store.notes.filter(\.pinned).count == 4)
+            // Pinning re-sorts the library; the sweep must survive that.
+            check("the sweep survives the re-sort", store.marked.count == 4)
+            store.togglePin(store.markedNotes)
+            check("pinning again unpins them all", store.notes.filter(\.pinned).isEmpty)
+            capture(to: base + "-pinned.png")
+        }
+
+        after(4.8) {
+            let before = store.notes.count
+            store.duplicate(store.markedNotes)
+            check("duplicating makes one copy each", store.notes.count == before + 4)
+            check("the copies become the sweep", store.marked.count == 4)
+            check("the copies are what's open", store.marked.contains(store.selection ?? UUID()))
+        }
+
+        after(5.4) {
+            let doomed = store.marked
+            let before = store.notes.count
+            store.requestDelete(store.markedNotes)
+            check("a sweep of written notes asks first", store.pendingBulkDelete?.count == 4)
+            store.confirmPendingBulkDelete()
+            check("confirming deletes every one", store.notes.count == before - 4)
+            check("and none of them is left behind",
+                  !store.notes.contains { doomed.contains($0.id) })
+            check("the sweep empties with them", store.marked.isEmpty)
+            check("something is still open", store.selection != nil)
+        }
+
+        after(6.0) {
+            store.markAll()
+            check("select-all takes everything the sidebar shows",
+                  store.marked.count == store.visible.count)
+            store.query = "Note 1"
+            let narrowed = store.visible
+            store.markAll()
+            check("and only what a search leaves showing", store.marked.count == narrowed.count)
+            store.query = ""
+            store.clearMarks()
+            check("deselecting empties the sweep", store.marked.isEmpty)
+            state("done")
+        }
+
+        after(6.8) {
+            print("SELFTEST: \(failures) failed check(s)")
+            NSApp.terminate(nil)
         }
     }
 

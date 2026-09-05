@@ -49,6 +49,20 @@ struct RootView: View {
             Text(deleteMessage)
         }
         .alert(
+            bulkDeleteTitle,
+            isPresented: Binding(
+                get: { store.pendingBulkDelete != nil },
+                set: { if !$0 { store.pendingBulkDelete = nil } }
+            )
+        ) {
+            Button(bulkDeleteVerb, role: .destructive) {
+                store.confirmPendingBulkDelete()
+            }
+            Button("Cancel", role: .cancel) { store.pendingBulkDelete = nil }
+        } message: {
+            Text(bulkDeleteMessage)
+        }
+        .alert(
             store.message?.title ?? "",
             isPresented: Binding(
                 get: { store.message != nil },
@@ -126,5 +140,41 @@ struct RootView: View {
             return "Poe stops editing it. \(file.displayPath) stays exactly where it is."
         }
         return "This note has \(note.wordCount) words. Deleting it cannot be undone."
+    }
+
+    // MARK: - Bulk delete confirmation
+
+    /// Removing a linked note and deleting a note are different acts, and a
+    /// sweep can hold both — so the wording says which, and how many of each.
+    private var bulkDeleteVerb: String {
+        guard let targets = store.pendingBulkDelete else { return "Delete" }
+        return targets.allSatisfy { $0.file != nil } ? "Remove" : "Delete"
+    }
+
+    private var bulkDeleteTitle: String {
+        guard let targets = store.pendingBulkDelete else { return "" }
+        return targets.allSatisfy { $0.file != nil }
+            ? "Remove \(targets.count) files from Poe?"
+            : "Delete \(targets.count) notes?"
+    }
+
+    private var bulkDeleteMessage: String {
+        guard let targets = store.pendingBulkDelete else { return "" }
+        let linked = targets.filter { $0.file != nil }.count
+        let plain = targets.filter { $0.file == nil }
+        var lines: [String] = []
+
+        if linked > 0 {
+            lines.append(linked == targets.count
+                ? "Poe stops editing them. The files stay exactly where they are."
+                : "\(linked) of them are files — Poe stops editing those, and they stay where they are.")
+        }
+        if !plain.isEmpty {
+            let words = plain.reduce(0) { $0 + $1.wordCount }
+            lines.append(plain.count == 1
+                ? "One note, \(words) words, will be deleted. That cannot be undone."
+                : "\(plain.count) notes, \(words) words in all, will be deleted. That cannot be undone.")
+        }
+        return lines.joined(separator: " ")
     }
 }

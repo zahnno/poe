@@ -1,3 +1,4 @@
+import AppKit
 import SwiftUI
 
 struct SidebarView: View {
@@ -5,6 +6,9 @@ struct SidebarView: View {
     @ObservedObject private var themeManager = ThemeManager.shared
     @FocusState private var searchFocused: Bool
     @Namespace private var highlight
+    /// The row under the pointer — the only thing that shows an untouched note's
+    /// tick box, so the list stays quiet until you reach for it.
+    @State private var hovered: UUID?
 
     var body: some View {
         VStack(spacing: 0) {
@@ -14,6 +18,7 @@ struct SidebarView: View {
             wordmark
             searchField
             list
+            if !store.marked.isEmpty { selectionBar }
             newNoteButton
         }
         .frame(width: 268)
@@ -29,6 +34,7 @@ struct SidebarView: View {
             // The caret moved to the note; stop drawing a focus ring here.
             searchFocused = false
         }
+        .animation(.spring(response: 0.34, dampingFraction: 0.85), value: store.marked.isEmpty)
     }
 
     // MARK: - Header
@@ -88,13 +94,21 @@ struct SidebarView: View {
             .menuIndicator(.hidden)
             .help("Themes (⌥⌘[ / ⌥⌘])")
 
-            Text("\(store.notes.count)")
-                .font(.system(size: 11, weight: .semibold, design: .rounded))
-                .foregroundStyle(Theme.inkFaint)
-                .monospacedDigit()
-                .padding(.horizontal, 7)
-                .padding(.vertical, 3)
-                .background(Capsule().fill(Color.white.opacity(0.06)))
+            Button { store.toggleMarkAll() } label: {
+                Text(store.marked.isEmpty ? "\(store.notes.count)" : "\(store.marked.count)/\(store.notes.count)")
+                    .font(.system(size: 11, weight: .semibold, design: .rounded))
+                    .foregroundStyle(store.marked.isEmpty ? Theme.inkFaint : Theme.accent)
+                    .monospacedDigit()
+                    .padding(.horizontal, 7)
+                    .padding(.vertical, 3)
+                    .background(
+                        Capsule().fill(store.marked.isEmpty
+                                       ? Color.white.opacity(0.06)
+                                       : Theme.accent.opacity(0.16))
+                    )
+            }
+            .buttonStyle(.plain)
+            .help("Select every note in the list (⇧⌘A)")
         }
         .padding(.horizontal, 18)
         .padding(.bottom, 14)
@@ -168,25 +182,29 @@ struct SidebarView: View {
 
     private func row(_ note: Note) -> some View {
         let selected = note.id == store.selection
+        let ticked = store.marked.contains(note.id)
+        // The box is only drawn once you're either sweeping already or pointing
+        // at the row — an idle list shows notes, not checkboxes.
+        let showTick = ticked || !store.marked.isEmpty || hovered == note.id
 
         return Button {
-            // Whether you were reading or writing carries across the switch;
-            // a document with no markdown in it drops the preview by itself.
-            store.selection = note.id
+            // A click means one of three things, and the modifier keys are what
+            // say which: plain opens the note, ⌘ ticks it, ⇧ takes the run from
+            // wherever the last click landed. Reading the flags here rather than
+            // through gesture modifiers keeps one hit target on the row.
+            let flags = NSEvent.modifierFlags
+            if flags.contains(.shift) {
+                store.extendMark(to: note.id)
+            } else if flags.contains(.command) {
+                store.toggleMark(note.id)
+            } else {
+                // Whether you were reading or writing carries across the switch;
+                // a document with no markdown in it drops the preview by itself.
+                store.choose(note.id)
+            }
         } label: {
             HStack(alignment: .top, spacing: 9) {
-                if note.pinned {
-                    Image(systemName: "pin.fill")
-                        .font(.system(size: 9))
-                        .foregroundStyle(Theme.accent)
-                        .padding(.top, 3)
-                } else if store.brokenLinks.contains(note.id) {
-                    Image(systemName: "exclamationmark.triangle.fill")
-                        .font(.system(size: 9))
-                        .foregroundStyle(Theme.rose)
-                        .padding(.top, 3)
-                        .help("The file behind this note is missing")
-                }
+                marker(note, ticked: ticked, showTick: showTick)
 
                 VStack(alignment: .leading, spacing: 3) {
                     HStack(spacing: 6) {
@@ -227,6 +245,11 @@ struct SidebarView: View {
                                 .strokeBorder(Theme.accent.opacity(0.28), lineWidth: 1)
                         )
                         .matchedGeometryEffect(id: "row", in: highlight)
+                } else if ticked {
+                    // A ticked row that isn't the one being edited: tinted, but
+                    // without the rail or the ring that mean "you are here".
+                    RoundedRectangle(cornerRadius: 11, style: .continuous)
+                        .fill(Theme.accent.opacity(0.11))
                 }
             }
             .overlay(alignment: .leading) {
@@ -241,41 +264,177 @@ struct SidebarView: View {
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
+        .onHover { inside in
+            if inside { hovered = note.id }
+            else if hovered == note.id { hovered = nil }
+        }
         .animation(.spring(response: 0.32, dampingFraction: 0.82), value: store.selection)
-        .contextMenu {
-            Button(note.pinned ? "Unpin" : "Pin") { store.togglePin(note.id) }
-            Button("Duplicate as Note") {
-                store.selection = note.id
-                store.duplicateSelected()
+        .animation(.easeOut(duration: 0.14), value: ticked)
+        .contextMenu { menu(for: note) }
+    }
+
+    /// The row's leading column: its tick box while you're choosing, and
+    /// otherwise whatever the note has to say for itself.
+    private func marker(_ note: Note, ticked: Bool, showTick: Bool) -> some View {
+        Group {
+            if showTick {
+                Image(systemName: ticked ? "checkmark.circle.fill" : "circle")
+                    .font(.system(size: 12))
+                    .foregroundStyle(ticked ? Theme.accent : Theme.inkFaint.opacity(0.65))
+                    .padding(.top, 1)
+            } else if note.pinned {
+                Image(systemName: "pin.fill")
+                    .font(.system(size: 9))
+                    .foregroundStyle(Theme.accent)
+                    .padding(.top, 3)
+            } else if store.brokenLinks.contains(note.id) {
+                Image(systemName: "exclamationmark.triangle.fill")
+                    .font(.system(size: 9))
+                    .foregroundStyle(Theme.rose)
+                    .padding(.top, 3)
+                    .help("The file behind this note is missing")
             }
-            Button("Copy Text") {
-                store.selection = note.id
-                store.copySelectedToPasteboard()
+        }
+        // A fixed column while there is anything to put in it, and none at all
+        // when there isn't — so titles don't sit indented over empty space.
+        .frame(width: showTick ? 13 : (note.pinned || store.brokenLinks.contains(note.id) ? 11 : 0))
+    }
+
+    // MARK: - Row menu
+
+    @ViewBuilder
+    private func menu(for note: Note) -> some View {
+        // Right-clicking inside the sweep acts on the whole sweep; right-clicking
+        // outside it acts on the one row, and leaves the sweep alone.
+        let targets = store.contextTargets(for: note)
+        let many = targets.count > 1
+        let linked = targets.filter { $0.file != nil }
+
+        if many {
+            Section("\(targets.count) notes selected") {
+                Button(targets.allSatisfy(\.pinned) ? "Unpin All" : "Pin All") { store.togglePin(targets) }
+                Button("Duplicate All") { store.duplicate(targets) }
+                Button("Copy Text") { store.copy(targets) }
+                Button("Export to Folder…") { store.export(targets) }
             }
+            if !linked.isEmpty {
+                Divider()
+                Button(linked.count == targets.count ? "Stop Editing Files" : "Stop Editing \(linked.count) Files") {
+                    store.unlink(linked)
+                }
+            }
+            Divider()
+            Button("Deselect") { store.clearMarks() }
+            Divider()
+            Button(linked.count == targets.count ? "Remove \(targets.count) from Poe" : "Delete \(targets.count) Notes",
+                   role: .destructive) {
+                store.requestDelete(targets)
+            }
+        } else {
+            Button(note.pinned ? "Unpin" : "Pin") { store.togglePin([note]) }
+            Button("Duplicate as Note") { store.duplicate([note]) }
+            Button("Copy Text") { store.copy([note]) }
             Button("Save As…") {
-                store.selection = note.id
+                store.choose(note.id)
                 store.saveSelectedAs()
             }
+            Button("Export to Folder…") { store.export([note]) }
             if note.file != nil {
                 Divider()
                 Button("Reveal File in Finder") {
-                    store.selection = note.id
+                    store.choose(note.id)
                     store.revealSelectedInFinder()
                 }
                 Button("Reload from Disk") {
-                    store.selection = note.id
+                    store.choose(note.id)
                     store.reloadSelectedFromDisk()
                 }
-                Button("Stop Editing File") {
-                    store.selection = note.id
-                    store.unlinkSelected()
-                }
+                Button("Stop Editing File") { store.unlink([note]) }
             }
+            Divider()
+            Button("Select This Note") { store.toggleMark(note.id) }
             Divider()
             Button(note.file == nil ? "Delete" : "Remove from Poe", role: .destructive) {
                 store.requestDelete(note)
             }
         }
+    }
+
+    // MARK: - Bulk actions
+
+    /// The bar that appears under the list once anything is ticked. Everything
+    /// it offers is also in the row menu; this is the version you can reach
+    /// without aiming at a particular row.
+    private var selectionBar: some View {
+        let targets = store.markedNotes
+        let allPinned = !targets.isEmpty && targets.allSatisfy(\.pinned)
+
+        return VStack(spacing: 9) {
+            HStack(spacing: 6) {
+                Image(systemName: "checkmark.circle.fill")
+                    .font(.system(size: 11))
+                    .foregroundStyle(Theme.accent)
+
+                Text(targets.count == 1 ? "1 note selected" : "\(targets.count) notes selected")
+                    .font(.system(size: 11.5, weight: .semibold, design: .rounded))
+                    .foregroundStyle(Theme.ink)
+                    .monospacedDigit()
+
+                Spacer(minLength: 4)
+
+                if targets.count < store.visible.count {
+                    Button("All") { store.markAll() }
+                        .buttonStyle(.plain)
+                        .font(.system(size: 11, weight: .medium, design: .rounded))
+                        .foregroundStyle(Theme.accent)
+                }
+
+                Button("Done") { store.clearMarks() }
+                    .buttonStyle(.plain)
+                    .font(.system(size: 11, weight: .medium, design: .rounded))
+                    .foregroundStyle(Theme.inkDim)
+            }
+
+            HStack(spacing: 5) {
+                bulkAction(allPinned ? "pin.slash" : "pin", allPinned ? "Unpin these" : "Pin these") {
+                    store.togglePin(targets)
+                }
+                bulkAction("plus.square.on.square", "Duplicate these") { store.duplicate(targets) }
+                bulkAction("doc.on.doc", "Copy their text") { store.copy(targets) }
+                bulkAction("square.and.arrow.down", "Export to a folder…") { store.export(targets) }
+                bulkAction("trash", "Delete these", destructive: true) { store.requestDelete(targets) }
+            }
+        }
+        .padding(.horizontal, 11)
+        .padding(.vertical, 10)
+        .background(
+            RoundedRectangle(cornerRadius: 12, style: .continuous)
+                .fill(Theme.accent.opacity(0.10))
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 12, style: .continuous)
+                .strokeBorder(Theme.accent.opacity(0.28), lineWidth: 1)
+        )
+        .padding(.horizontal, 14)
+        .padding(.bottom, 10)
+        .transition(.move(edge: .bottom).combined(with: .opacity))
+    }
+
+    private func bulkAction(_ symbol: String, _ help: String, destructive: Bool = false,
+                            action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            Image(systemName: symbol)
+                .font(.system(size: 12, weight: .medium))
+                .foregroundStyle(destructive ? Theme.rose : Theme.inkDim)
+                .frame(maxWidth: .infinity)
+                .frame(height: 26)
+                .background(
+                    RoundedRectangle(cornerRadius: 8, style: .continuous)
+                        .fill(Color.white.opacity(0.06))
+                )
+        }
+        .buttonStyle(PressableButtonStyle())
+        .help(help)
     }
 
     // MARK: - Footer

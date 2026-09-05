@@ -68,6 +68,20 @@ final class NoteStore: ObservableObject {
         }
     }
     @Published var pendingDelete: Note?
+    /// A delete of several notes at once, waiting on its confirmation.
+    @Published var pendingBulkDelete: [Note]?
+
+    // MARK: Multi-selection
+    //
+    // `selection` is the note in the editor; this is the set the sidebar has
+    // ticked. Empty means there is no multi-selection at all, and every note
+    // command falls back to acting on the open note — which is what keeps the
+    // menu bar honest whether or not the sidebar is in the middle of a sweep.
+
+    @Published var marked: Set<UUID> = []
+    /// Where a shift-click measures its range from.
+    private var markAnchor: UUID?
+
     @Published var searchFocusToken: Int = 0
     @Published var editorFocusToken: Int = 0
 
@@ -413,6 +427,27 @@ final class NoteStore: ObservableObject {
         return position(of: selection)
     }
 
+    /// The ticked notes, in the order the sidebar lists them — so an export, a
+    /// copy or a delete happens in the order the user can see, not in whatever
+    /// order a hash set happens to hold.
+    var markedNotes: [Note] {
+        guard !marked.isEmpty else { return [] }
+        return sorted.filter { marked.contains($0.id) }
+    }
+
+    /// What a note command applies to: the ticked notes when there are any,
+    /// otherwise the one that's open.
+    var actionTargets: [Note] {
+        let ticked = markedNotes
+        return ticked.isEmpty ? (selectedNote.map { [$0] } ?? []) : ticked
+    }
+
+    /// What a row's own context menu applies to: the whole ticked set when the
+    /// row belongs to it, and just that row when it doesn't.
+    func contextTargets(for note: Note) -> [Note] {
+        marked.contains(note.id) ? markedNotes : [note]
+    }
+
     var canPreview: Bool {
         selectedNote?.kind.rendersMarkdown ?? false
     }
@@ -623,11 +658,20 @@ final class NoteStore: ObservableObject {
 
     /// Keep the text, drop the tether — the file on disk stops changing.
     func unlinkSelected() {
-        guard let index = selectedIndex, notes[index].file != nil else { return }
-        unflushed.remove(notes[index].id)
-        brokenLinks.remove(notes[index].id)
-        notes[index].file = nil
-        notes[index].updated = Date()
+        unlink(actionTargets)
+    }
+
+    func unlink(_ targets: [Note]) {
+        var changed = false
+        for note in targets {
+            guard let index = position(of: note.id), notes[index].file != nil else { continue }
+            unflushed.remove(notes[index].id)
+            brokenLinks.remove(notes[index].id)
+            notes[index].file = nil
+            notes[index].updated = Date()
+            changed = true
+        }
+        guard changed else { return }
         libraryChanged()
         scheduleSave()
     }
@@ -652,18 +696,31 @@ final class NoteStore: ObservableObject {
         }
         query = ""
         previewing = false
+        marked.removeAll()
+        markAnchor = nil
         focusEditor()
     }
 
     func delete(_ id: UUID) {
-        guard let index = position(of: id) else { return }
-        let wasSelected = selection == id
-        let neighbours = visible
-        let row = neighbours.firstIndex { $0.id == id }
-        notes.remove(at: index)
-        unflushed.remove(id)
-        brokenLinks.remove(id)
+        delete(ids: [id])
+    }
+
+    /// Remove a whole set in one pass. Deleting them one at a time re-sorted the
+    /// library and re-picked a neighbour after each one, so a sweep of twenty
+    /// notes moved the editor twenty times on its way to the note it settles on.
+    func delete(ids: Set<UUID>) {
+        guard !ids.isEmpty, notes.contains(where: { ids.contains($0.id) }) else { return }
+        let wasSelected = selection.map { ids.contains($0) } ?? false
+        // Where the topmost casualty sat, so the editor lands on its neighbour.
+        let row = visible.firstIndex { ids.contains($0.id) }
+
+        notes.removeAll { ids.contains($0.id) }
+        unflushed.subtract(ids)
+        brokenLinks.subtract(ids)
+        marked.subtract(ids)
+        if let anchor = markAnchor, ids.contains(anchor) { markAnchor = nil }
         libraryChanged()
+
         if wasSelected {
             let remaining = visible
             if let row, !remaining.isEmpty {
@@ -677,8 +734,7 @@ final class NoteStore: ObservableObject {
     }
 
     func deleteSelected() {
-        guard let note = selectedNote else { return }
-        requestDelete(note)
+        requestDelete(actionTargets)
     }
 
     /// Empty notes go quietly; anything with words in it — or a file behind it —
@@ -691,10 +747,30 @@ final class NoteStore: ObservableObject {
         }
     }
 
+    /// The same question asked of a whole set. One note keeps the singular
+    /// wording it always had; a set of nothing but blank, unlinked notes still
+    /// goes quietly.
+    func requestDelete(_ targets: [Note]) {
+        guard !targets.isEmpty else { return }
+        if targets.count == 1 {
+            requestDelete(targets[0])
+        } else if targets.allSatisfy({ $0.isEmpty && $0.file == nil }) {
+            delete(ids: Set(targets.map(\.id)))
+        } else {
+            pendingBulkDelete = targets
+        }
+    }
+
     func confirmPendingDelete() {
         guard let note = pendingDelete else { return }
         pendingDelete = nil
         delete(note.id)
+    }
+
+    func confirmPendingBulkDelete() {
+        guard let targets = pendingBulkDelete else { return }
+        pendingBulkDelete = nil
+        delete(ids: Set(targets.map(\.id)))
     }
 
     func togglePin(_ id: UUID) {
@@ -705,18 +781,94 @@ final class NoteStore: ObservableObject {
     }
 
     func togglePinSelected() {
-        guard let selection else { return }
-        togglePin(selection)
+        togglePin(actionTargets)
+    }
+
+    /// Pin the whole set — or unpin it, once every note in it is already
+    /// pinned. A mixed set pins, the way a checkbox over many rows behaves.
+    func togglePin(_ targets: [Note]) {
+        guard !targets.isEmpty else { return }
+        let pin = !targets.allSatisfy(\.pinned)
+        for note in targets {
+            guard let index = position(of: note.id) else { continue }
+            notes[index].pinned = pin
+        }
+        libraryChanged()
+        scheduleSave()
     }
 
     /// A duplicate is a note, never a second writer on the same file.
     func duplicateSelected() {
-        guard let note = selectedNote else { return }
-        let copy = Note(text: note.text)
-        notes.append(copy)
+        duplicate(actionTargets)
+    }
+
+    func duplicate(_ targets: [Note]) {
+        guard !targets.isEmpty else { return }
+        let copies = targets.map { Note(text: $0.text) }
+        notes.append(contentsOf: copies)
         libraryChanged()
-        selection = copy.id
+        // The copies become the sweep, so whatever you do next lands on them
+        // rather than on the originals you just copied.
+        marked = copies.count > 1 ? Set(copies.map(\.id)) : []
+        markAnchor = copies.first?.id
+        selection = copies.first?.id
         scheduleSave()
+    }
+
+    // MARK: - Multi-selection
+
+    /// A plain click: one note, and the anchor a later shift-click measures from.
+    func choose(_ id: UUID) {
+        marked.removeAll()
+        markAnchor = id
+        selection = id
+    }
+
+    /// Command-click: tick or untick one note without disturbing the rest.
+    func toggleMark(_ id: UUID) {
+        if marked.contains(id) {
+            marked.remove(id)
+        } else {
+            // The first tick brings the open note in with it — otherwise
+            // ticking a second note would silently drop the first.
+            if marked.isEmpty, let selection, selection != id { marked.insert(selection) }
+            marked.insert(id)
+            selection = id
+        }
+        markAnchor = id
+    }
+
+    /// Shift-click: everything between the anchor and here. The anchor stays
+    /// put, so shift-clicking again re-measures from the same place rather than
+    /// growing the range one note at a time.
+    func extendMark(to id: UUID) {
+        let list = visible
+        guard let end = list.firstIndex(where: { $0.id == id }) else { return }
+        let anchor = (markAnchor ?? selection).flatMap { start in list.firstIndex { $0.id == start } }
+        guard let anchor else { choose(id); return }
+        let span = anchor <= end ? anchor...end : end...anchor
+        marked = Set(list[span].map(\.id))
+        selection = id
+    }
+
+    /// Tick everything the sidebar is showing — a search narrows what "all"
+    /// means, which is the point of running one first.
+    func markAll() {
+        sidebarVisible = true
+        let list = visible
+        guard !list.isEmpty else { return }
+        marked = Set(list.map(\.id))
+        if markAnchor == nil { markAnchor = selection ?? list.first?.id }
+    }
+
+    func clearMarks() {
+        marked.removeAll()
+        markAnchor = selection
+    }
+
+    func toggleMarkAll() {
+        let list = visible
+        if !marked.isEmpty, marked.count >= list.count { clearMarks() } else { markAll() }
     }
 
     func step(_ offset: Int) {
@@ -986,9 +1138,78 @@ final class NoteStore: ObservableObject {
     }
 
     func copySelectedToPasteboard() {
-        guard let note = selectedNote else { return }
+        copy(actionTargets)
+    }
+
+    func copy(_ targets: [Note]) {
+        guard !targets.isEmpty else { return }
+        // One note copies as itself. Several are stitched together under their
+        // own titles, so what lands in the paste can still be read apart.
+        let text = targets.count == 1
+            ? targets[0].text
+            : targets.map { "# \($0.title)\n\n\($0.text)" }.joined(separator: "\n\n---\n\n")
         NSPasteboard.general.clearContents()
-        NSPasteboard.general.setString(note.text, forType: .string)
+        NSPasteboard.general.setString(text, forType: .string)
+    }
+
+    /// Write a copy of each note into a folder of the user's choosing.
+    ///
+    /// Deliberately not Save As: exporting a sweep of twenty notes should not
+    /// leave twenty files that Poe now writes to on every keystroke. The notes
+    /// stay notes, and nothing already in the folder is overwritten.
+    func export(_ targets: [Note]) {
+        guard !targets.isEmpty else { return }
+
+        let panel = NSOpenPanel()
+        panel.canChooseFiles = false
+        panel.canChooseDirectories = true
+        panel.canCreateDirectories = true
+        panel.allowsMultipleSelection = false
+        panel.prompt = "Export"
+        panel.message = targets.count == 1
+            ? "Choose a folder to export this note into"
+            : "Choose a folder to export \(targets.count) notes into"
+        guard panel.runModal() == .OK, let folder = panel.url else { return }
+
+        var taken: Set<String> = []
+        var exported = 0
+        var failed: [String] = []
+
+        for note in targets {
+            let stem = note.file.map { ($0.name as NSString).deletingPathExtension } ?? sanitize(note.title)
+            let extensionName = note.file?.url.pathExtension
+            let suffix = (extensionName?.isEmpty == false ? extensionName! : "md")
+
+            var name = "\(stem).\(suffix)"
+            var attempt = 2
+            while taken.contains(name.lowercased())
+                    || FileManager.default.fileExists(atPath: folder.appendingPathComponent(name).path) {
+                name = "\(stem) \(attempt).\(suffix)"
+                attempt += 1
+            }
+            taken.insert(name.lowercased())
+
+            do {
+                var link = note.file ?? FileLink(path: folder.appendingPathComponent(name).path)
+                link.path = folder.appendingPathComponent(name).path
+                try TextFile.write(note.text, to: link)
+                exported += 1
+            } catch {
+                failed.append(name)
+            }
+        }
+
+        if failed.isEmpty {
+            message = PoeMessage(
+                title: exported == 1 ? "Exported 1 note" : "Exported \(exported) notes",
+                body: "Written to \(folder.path)."
+            )
+        } else {
+            message = PoeMessage(
+                title: "Couldn’t export everything",
+                body: "\(exported) written to \(folder.path). These couldn’t be: \(failed.joined(separator: ", "))."
+            )
+        }
     }
 
     private func sanitize(_ name: String) -> String {
