@@ -2,7 +2,7 @@ import SwiftUI
 import UniformTypeIdentifiers
 
 struct RootView: View {
-    @EnvironmentObject var store: NoteStore
+    @EnvironmentObject var store: Workspace
     @ObservedObject private var themeManager = ThemeManager.shared
     @State private var dropTargeted = false
 
@@ -19,6 +19,10 @@ struct RootView: View {
                 EditorView()
                     .frame(maxWidth: .infinity)
             }
+            // The title bar is hidden, but SwiftUI still keeps its height clear
+            // above the content — on top of the room the sidebar and toolbar
+            // already leave for the traffic lights, which paid for them twice.
+            .ignoresSafeArea(.container, edges: .top)
             // A flat veil, not `.ultraThinMaterial`. A material is a live
             // backdrop blur, and this one covered the whole window over a
             // background that never stops moving — so it re-blurred every
@@ -29,6 +33,11 @@ struct RootView: View {
             if dropTargeted { dropOverlay }
         }
         .frame(minWidth: 720, minHeight: 480)
+        // The title bar is hidden, but the Window menu, Mission Control and
+        // the Dock still name each window by it — so with several open, each
+        // says which note it's showing.
+        .navigationTitle(store.selectedNote?.title ?? "Poe")
+        .background(WindowAccessor(floating: store.floating) { [weak store] in store?.becameKey() })
         .preferredColorScheme(themeManager.currentTheme.isLight ? .light : .dark)
         .tint(Theme.accent)
         .onDrop(of: [.fileURL], isTargeted: $dropTargeted.animation(.easeOut(duration: 0.15))) { providers in
@@ -77,8 +86,9 @@ struct RootView: View {
         .onOpenURL { url in
             // SwiftUI claims the open-documents event for a `WindowGroup` app and
             // hands the app delegate an empty list, so this is where files that
-            // come from Finder, the Dock, or `open -a Poe` actually arrive.
-            store.open([url])
+            // come from Finder, the Dock, or `open -a Poe` actually arrive. They
+            // go to the window in front, whichever window heard about them.
+            Workspace.openExternal([url])
         }
         .onAppear {
             // Start in the note itself — the search field can wait for Cmd F.
@@ -176,5 +186,66 @@ struct RootView: View {
                 : "\(plain.count) notes, \(words) words in all, will be deleted. That cannot be undone.")
         }
         return lines.joined(separator: " ")
+    }
+}
+
+// MARK: - The window itself
+
+/// Reaches the `NSWindow` SwiftUI put this view in, to dress it the way Poe
+/// wants — a titlebar the aurora bleeds through, no system tabs on top of our
+/// own — to float it when asked, and to say when it comes to the front.
+///
+/// Done per window, as each one appears: dressing `NSApp.windows` once at
+/// launch missed every window opened after it.
+struct WindowAccessor: NSViewRepresentable {
+    var floating: Bool
+    var onBecomeKey: () -> Void
+
+    func makeNSView(context: Context) -> WindowTracker {
+        let view = WindowTracker()
+        view.onBecomeKey = onBecomeKey
+        return view
+    }
+
+    func updateNSView(_ view: WindowTracker, context: Context) {
+        view.onBecomeKey = onBecomeKey
+        view.floating = floating
+    }
+}
+
+final class WindowTracker: NSView {
+    var onBecomeKey: () -> Void = {}
+    var floating = false {
+        didSet { applyLevel() }
+    }
+    private var observer: NSObjectProtocol?
+
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        if let observer { NotificationCenter.default.removeObserver(observer) }
+        observer = nil
+        guard let window else { return }
+
+        window.titlebarAppearsTransparent = true
+        window.isMovableByWindowBackground = true
+        window.tabbingMode = .disallowed
+        window.backgroundColor = NSColor(Theme.void)
+        window.appearance = Theme.current.isLight ? NSAppearance(named: .aqua) : NSAppearance(named: .darkAqua)
+        applyLevel()
+
+        observer = NotificationCenter.default.addObserver(
+            forName: NSWindow.didBecomeKeyNotification, object: window, queue: .main
+        ) { [weak self] _ in
+            self?.onBecomeKey()
+        }
+        if window.isKeyWindow { onBecomeKey() }
+    }
+
+    private func applyLevel() {
+        window?.level = floating ? .floating : .normal
+    }
+
+    deinit {
+        if let observer { NotificationCenter.default.removeObserver(observer) }
     }
 }

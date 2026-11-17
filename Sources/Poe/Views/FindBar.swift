@@ -7,7 +7,7 @@ import SwiftUI
 /// that's open, and says how many times the word turns up in it. It only ever
 /// reads: nothing typed here can change a note, or the file behind it.
 struct FindBar: View {
-    @EnvironmentObject var store: NoteStore
+    @EnvironmentObject var store: Workspace
     @FocusState private var focused: Bool
 
     var body: some View {

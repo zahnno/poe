@@ -17,8 +17,10 @@ import Foundation
 @MainActor
 enum LiveBench {
 
+    /// The window in front — what the harness drives.
+    private static var store: Workspace { Workspace.active ?? NoteStore.shared.liveWorkspaces[0] }
+
     static func run() {
-        let store = NoteStore.shared
         let notes = Int(ProcessInfo.processInfo.environment["POE_BENCH_NOTES"] ?? "") ?? 20
         let size = Int(ProcessInfo.processInfo.environment["POE_BENCH_SIZE"] ?? "") ?? 40_000
         let strokes = Int(ProcessInfo.processInfo.environment["POE_BENCH_STROKES"] ?? "") ?? 120

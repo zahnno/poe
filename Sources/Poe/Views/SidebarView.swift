@@ -2,8 +2,9 @@ import AppKit
 import SwiftUI
 
 struct SidebarView: View {
-    @EnvironmentObject var store: NoteStore
+    @EnvironmentObject var store: Workspace
     @ObservedObject private var themeManager = ThemeManager.shared
+    @Environment(\.openWindow) private var openWindow
     @FocusState private var searchFocused: Bool
     @Namespace private var highlight
     /// The row under the pointer — the only thing that shows an untouched note's
@@ -13,7 +14,7 @@ struct SidebarView: View {
     var body: some View {
         VStack(spacing: 0) {
             // Room for the traffic lights, since the title bar is hidden.
-            Color.clear.frame(height: 30)
+            Color.clear.frame(height: 34)
 
             wordmark
             searchField
@@ -188,12 +189,15 @@ struct SidebarView: View {
         let showTick = ticked || !store.marked.isEmpty || hovered == note.id
 
         return Button {
-            // A click means one of three things, and the modifier keys are what
-            // say which: plain opens the note, ⌘ ticks it, ⇧ takes the run from
-            // wherever the last click landed. Reading the flags here rather than
-            // through gesture modifiers keeps one hit target on the row.
+            // A click means one of four things, and the modifier keys are what
+            // say which: plain opens the note, ⌥ opens it in a new tab, ⌘ ticks
+            // it, ⇧ takes the run from wherever the last click landed. Reading
+            // the flags here rather than through gesture modifiers keeps one
+            // hit target on the row.
             let flags = NSEvent.modifierFlags
-            if flags.contains(.shift) {
+            if flags.contains(.option) {
+                store.openInNewTab(note.id)
+            } else if flags.contains(.shift) {
                 store.extendMark(to: note.id)
             } else if flags.contains(.command) {
                 store.toggleMark(note.id)
@@ -331,6 +335,12 @@ struct SidebarView: View {
                 store.requestDelete(targets)
             }
         } else {
+            Button("Open in New Tab") { store.openInNewTab(note.id) }
+            Button("Open in New Window") {
+                Workspace.pendingNote = note.id
+                openWindow(id: PoeWindow.id)
+            }
+            Divider()
             Button(note.pinned ? "Unpin" : "Pin") { store.togglePin([note]) }
             Button("Duplicate as Note") { store.duplicate([note]) }
             Button("Copy Text") { store.copy([note]) }

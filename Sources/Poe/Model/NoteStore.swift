@@ -15,7 +15,14 @@ struct FindMatch: Equatable {
     var block: Int?
 }
 
-/// Owns every note, persists them to disk, and drives the UI.
+/// Something worth telling the writer, shown as an alert in their window.
+struct PoeMessage: Identifiable {
+    let id = UUID()
+    var title: String
+    var body: String
+}
+
+/// The library: every note, persisted to disk, shared by every window.
 ///
 /// Notes live in a single JSON document under Application Support. Writes are
 /// debounced so a fast typist never touches the disk more than once per second,
@@ -24,6 +31,10 @@ struct FindMatch: Equatable {
 /// A note may additionally be *linked* to a file the user opened. Linked notes
 /// still live in the library — so they are searchable and survive a relaunch —
 /// but every save also writes the text straight back to the original file.
+///
+/// What a window is *looking at* — its tabs, the open note, the preview, the
+/// find bar, the sidebar's search — belongs to that window's `Workspace`, so
+/// two windows can read two different notes out of the one library.
 @MainActor
 final class NoteStore: ObservableObject {
 
@@ -44,89 +55,11 @@ final class NoteStore: ObservableObject {
 
     /// Bumped whenever the library changes in a way the UI can see. Views
     /// observe the store as a whole, so this is what invalidates them — and
-    /// what the derived values below are cached against.
+    /// what the derived values in each workspace are cached against.
     @Published private(set) var libraryVersion: Int = 0
 
-    @Published var query: String = ""
-
-    @Published var selection: UUID? {
-        didSet {
-            // A code or data file has no markdown to preview.
-            if previewing, !(selectedNote?.kind.rendersMarkdown ?? true) { previewing = false }
-            // A different document: the same word, counted afresh from the top,
-            // since the caret we'd otherwise start from belongs to the last one.
-            if oldValue != selection { refreshFind(reveal: true, from: 0) }
-        }
-    }
-
-    @Published var sidebarVisible: Bool = true
-    @Published var previewing: Bool = false {
-        didSet {
-            // Reading and writing show different words — the same search has to
-            // be counted again against whichever is on screen.
-            if previewing != oldValue, findVisible { refreshFind(reveal: true, from: 0) }
-        }
-    }
-    @Published var pendingDelete: Note?
-    /// A delete of several notes at once, waiting on its confirmation.
-    @Published var pendingBulkDelete: [Note]?
-
-    // MARK: Multi-selection
-    //
-    // `selection` is the note in the editor; this is the set the sidebar has
-    // ticked. Empty means there is no multi-selection at all, and every note
-    // command falls back to acting on the open note — which is what keeps the
-    // menu bar honest whether or not the sidebar is in the middle of a sweep.
-
-    @Published var marked: Set<UUID> = []
-    /// Where a shift-click measures its range from.
-    private var markAnchor: UUID?
-
-    @Published var searchFocusToken: Int = 0
-    @Published var editorFocusToken: Int = 0
-
-    // MARK: Find in the open document
-    //
-    // The sidebar's `query` sifts the whole library; this is the other search —
-    // a find bar over the one document that is open, the way ⌘F behaves in every
-    // other editor. The text view owns the matching, so what lives here is only
-    // what the bar draws and the commands that drive it.
-
-    @Published var findVisible: Bool = false
-    @Published var findQuery: String = "" {
-        didSet { if findQuery != oldValue { findQueryChanged() } }
-    }
-    /// Every match in the open document, in UTF-16 — the units both the editor
-    /// and `AttributedString` count in — so nothing has to search twice.
-    @Published private(set) var findMatches: [FindMatch] = []
-    /// Which match is current, counting from one; zero when there are none.
-    @Published private(set) var findIndex: Int = 0
-    /// True when a document had more matches than we were willing to collect —
-    /// the bar says so rather than quietly reporting a smaller number.
-    @Published private(set) var findCapped: Bool = false
-    @Published var findFocusToken: Int = 0
-    /// Bumped only when the current match moves on purpose — a new search, or
-    /// ⌘G. Typing in the document recounts without dragging the view anywhere.
-    @Published private(set) var findRevealToken: Int = 0
-
-    var findCount: Int { findMatches.count }
-
-    /// Past this many bytes, a document is recounted — and a search of it
-    /// re-run — once the typing pauses rather than on every keystroke: a full
-    /// pass over 8 MB costs an eighth of a second, which the writer would feel.
-    private static let instantFindLimit = 200_000
-    /// And past this many matches we stop collecting. Nothing useful happens
-    /// beyond it, and the list itself starts to cost more than the search.
-    private static let findMatchLimit = 20_000
-    private var findRecount: Task<Void, Never>?
-    /// The rendered text of the document being searched, kept between
-    /// keystrokes: the markdown behind a long note is parsed once, not once per
-    /// letter typed into the find field.
-    private var rendered: (text: String, blocks: [String])?
-
     /// Linked notes whose file has moved, been deleted, or refused a write.
-    @Published var brokenLinks: Set<UUID> = []
-    @Published var message: PoeMessage?
+    @Published private(set) var brokenLinks: Set<UUID> = []
 
     /// Linked notes carrying words their file hasn't been given yet.
     ///
@@ -149,17 +82,23 @@ final class NoteStore: ObservableObject {
     /// True between handing a snapshot to the writer and hearing back.
     private var writing = false
 
-    /// The sifted, sorted library, and the counts under the editor. Both are
-    /// derived from every note's text, and both used to be recomputed several
-    /// times per redraw — `visible` twice in one pass of the sidebar's body.
-    /// They are answered once per version instead.
-    private var cachedVisible: (version: Int, query: String, notes: [Note])?
-    private var cachedStats: (version: Int, id: UUID?, stats: Stats)?
+    // MARK: - Windows
 
-    struct PoeMessage: Identifiable {
-        let id = UUID()
-        var title: String
-        var body: String
+    /// Every window's workspace, held weakly: a closed window's state goes with
+    /// it. The library tells them when notes they may be showing disappear.
+    private var workspaces: [WeakWorkspace] = []
+
+    private struct WeakWorkspace {
+        weak var value: Workspace?
+    }
+
+    func register(_ workspace: Workspace) {
+        workspaces.removeAll { $0.value == nil }
+        workspaces.append(WeakWorkspace(value: workspace))
+    }
+
+    var liveWorkspaces: [Workspace] {
+        workspaces.compactMap(\.value)
     }
 
     // MARK: - Invalidation
@@ -201,6 +140,12 @@ final class NoteStore: ObservableObject {
 
     nonisolated static var fileURL: URL { directory.appendingPathComponent("notes.json") }
 
+    /// True when the library is a scratch one the self test pointed us at —
+    /// nothing about it should leak into the real app's remembered state.
+    nonisolated static var isScratch: Bool {
+        !(ProcessInfo.processInfo.environment["POE_LIBRARY"] ?? "").isEmpty
+    }
+
     // MARK: - Lifecycle
 
     private init() {
@@ -212,7 +157,6 @@ final class NoteStore: ObservableObject {
             scheduleSave()
         }
         libraryChanged()
-        selection = sorted.first?.id
     }
 
     private func load() {
@@ -356,7 +300,7 @@ final class NoteStore: ObservableObject {
 
     private static let writer = Writer()
 
-    // MARK: - Derived state
+    // MARK: - Lookup
 
     /// Pinned first, then most recently touched.
     var sorted: [Note] {
@@ -364,31 +308,6 @@ final class NoteStore: ObservableObject {
             if a.pinned != b.pinned { return a.pinned }
             return a.updated > b.updated
         }
-    }
-
-    /// What the sidebar lists. Answered from the cache until the library or the
-    /// search changes: the filter reads every note's full text, and the sidebar
-    /// asks for this more than once per pass.
-    var visible: [Note] {
-        if let cached = cachedVisible, cached.version == libraryVersion, cached.query == query {
-            return cached.notes
-        }
-        let notes = sorted.filter { $0.matches(query) }
-        cachedVisible = (libraryVersion, query, notes)
-        return notes
-    }
-
-    /// Words, characters and lines under the editor — one pass over the whole
-    /// document, taken once per settled change rather than once per redraw.
-    typealias Stats = Note.Counts
-
-    var stats: Stats {
-        if let cached = cachedStats, cached.version == libraryVersion, cached.id == selection {
-            return cached.stats
-        }
-        let stats = selectedNote?.counts ?? Stats()
-        cachedStats = (libraryVersion, selection, stats)
-        return stats
     }
 
     /// Where each note sits in `notes`.
@@ -417,59 +336,30 @@ final class NoteStore: ObservableObject {
         return found
     }
 
-    var selectedNote: Note? {
-        guard let index = selectedIndex else { return nil }
-        return notes[index]
+    func note(_ id: UUID?) -> Note? {
+        guard let id, let position = position(of: id) else { return nil }
+        return notes[position]
     }
 
-    var selectedIndex: Int? {
-        guard let selection else { return nil }
-        return position(of: selection)
+    func contains(_ id: UUID) -> Bool {
+        position(of: id) != nil
     }
 
-    /// The ticked notes, in the order the sidebar lists them — so an export, a
-    /// copy or a delete happens in the order the user can see, not in whatever
-    /// order a hash set happens to hold.
-    var markedNotes: [Note] {
-        guard !marked.isEmpty else { return [] }
-        return sorted.filter { marked.contains($0.id) }
-    }
-
-    /// What a note command applies to: the ticked notes when there are any,
-    /// otherwise the one that's open.
-    var actionTargets: [Note] {
-        let ticked = markedNotes
-        return ticked.isEmpty ? (selectedNote.map { [$0] } ?? []) : ticked
-    }
-
-    /// What a row's own context menu applies to: the whole ticked set when the
-    /// row belongs to it, and just that row when it doesn't.
-    func contextTargets(for note: Note) -> [Note] {
-        marked.contains(note.id) ? markedNotes : [note]
-    }
-
-    var canPreview: Bool {
-        selectedNote?.kind.rendersMarkdown ?? false
-    }
-
-    /// Two-way binding onto the selected note's text, with save + timestamp bookkeeping.
-    var currentText: Binding<String> {
-        Binding(
-            get: { self.selectedNote?.text ?? "" },
-            set: { self.edit(to: $0) }
-        )
-    }
+    // MARK: - Editing
 
     /// A keystroke. Everything here is O(1) in the size of the document except
-    /// the assignment itself, and nothing on this path re-renders the window:
+    /// the assignment itself, and nothing on this path re-renders a window:
     /// the text view already shows the change, and the chrome that hasn't seen
     /// it yet catches up when the typing settles.
-    private func edit(to newValue: String) {
-        guard let index = selectedIndex else { return }
+    ///
+    /// Returns false when the text didn't actually change.
+    @discardableResult
+    func edit(_ id: UUID, to newValue: String) -> Bool {
+        guard let index = position(of: id) else { return false }
         let previous = notes[index].text
         // Comparing lengths first — O(1) — so an ordinary keystroke, which
         // always changes the length, never compares two whole documents.
-        if previous.utf8.count == newValue.utf8.count, previous == newValue { return }
+        if previous.utf8.count == newValue.utf8.count, previous == newValue { return false }
 
         notes[index].text = newValue
         notes[index].updated = Date()
@@ -483,62 +373,41 @@ final class NoteStore: ObservableObject {
         } else {
             libraryWillSettle()
         }
+        return true
+    }
 
-        // Every match past the edit has shifted; keep the tally honest,
-        // but don't yank the view off to one of them.
-        // Bytes, not UTF-16 units, which a string has to be walked to count.
-        // They only ever over-estimate, so the threshold still holds.
-        if findVisible { scheduleFindRecount(length: newValue.utf8.count) }
+    /// A blank note to write in. Reuses one that's already blank rather than
+    /// littering the library with empties.
+    func blankNote() -> UUID {
+        if let blank = sorted.first(where: { $0.isEmpty && !$0.pinned && $0.file == nil }) {
+            return blank.id
+        }
+        let note = Note()
+        notes.append(note)
+        libraryChanged()
+        scheduleSave()
+        return note.id
     }
 
     // MARK: - Opening files
 
-    /// Ask for files and open them. Nothing is filtered out up front: an
-    /// extension-less config file is as openable as a `.md`, and anything that
-    /// turns out to be binary is refused with a reason once we look inside.
-    func openFromPanel() {
-        let panel = NSOpenPanel()
-        panel.allowsMultipleSelection = true
-        panel.canChooseFiles = true
-        panel.canChooseDirectories = false
-        panel.treatsFilePackagesAsDirectories = false
-        panel.message = "Open a text file — Markdown, plain text, code, or data."
-        panel.prompt = "Open"
-        if panel.runModal() == .OK { open(panel.urls) }
-    }
-
-    /// Open files from anywhere: the panel, Finder, a drop on the window, or
-    /// `open -a Poe notes.md` in a terminal.
-    func open(_ urls: [URL]) {
-        var lastOpened: UUID?
+    /// Read files into the library — from the panel, Finder, a drop on a
+    /// window, or `open -a Poe notes.md` in a terminal. Returns the notes that
+    /// now hold them, in order, and why any couldn't be opened.
+    func load(_ urls: [URL]) -> (opened: [UUID], failures: [String]) {
+        var opened: [UUID] = []
         var failures: [String] = []
-
         for url in urls {
             do {
                 let loaded = try TextFile.read(url)
-                lastOpened = adopt(loaded)
+                let id = adopt(loaded)
+                if !opened.contains(id) { opened.append(id) }
             } catch {
                 failures.append(error.localizedDescription)
             }
         }
-
-        if let lastOpened {
-            query = ""
-            selection = lastOpened
-            // A markdown file arrives as a document to read; everything else —
-            // a note, a config file, code — arrives as something to edit.
-            previewing = selectedNote?.kind == .markdown
-            focusEditor()
-            scheduleSave()
-            NSApp.activate(ignoringOtherApps: true)
-        }
-
-        if !failures.isEmpty {
-            message = PoeMessage(
-                title: failures.count == 1 ? "Couldn’t open that file" : "Couldn’t open \(failures.count) files",
-                body: failures.joined(separator: "\n\n")
-            )
-        }
+        if !opened.isEmpty { scheduleSave() }
+        return (opened, failures)
     }
 
     /// Fold a freshly read file into the library, reusing the note that already
@@ -640,27 +509,19 @@ final class NoteStore: ObservableObject {
     }
 
     /// Discard local edits and take whatever the file says now.
-    func reloadSelectedFromDisk() {
-        guard let index = selectedIndex, let link = notes[index].file else { return }
-        do {
-            let loaded = try TextFile.read(link.url)
-            notes[index].text = loaded.text
-            notes[index].file = loaded.link
-            notes[index].updated = loaded.modified
-            unflushed.remove(notes[index].id)
-            brokenLinks.remove(notes[index].id)
-            libraryChanged()
-            scheduleSave()
-        } catch {
-            message = PoeMessage(title: "Couldn’t reload", body: error.localizedDescription)
-        }
+    func reloadFromDisk(_ id: UUID) throws {
+        guard let index = position(of: id), let link = notes[index].file else { return }
+        let loaded = try TextFile.read(link.url)
+        notes[index].text = loaded.text
+        notes[index].file = loaded.link
+        notes[index].updated = loaded.modified
+        unflushed.remove(notes[index].id)
+        brokenLinks.remove(notes[index].id)
+        libraryChanged()
+        scheduleSave()
     }
 
     /// Keep the text, drop the tether — the file on disk stops changing.
-    func unlinkSelected() {
-        unlink(actionTargets)
-    }
-
     func unlink(_ targets: [Note]) {
         var changed = false
         for note in targets {
@@ -676,112 +537,33 @@ final class NoteStore: ObservableObject {
         scheduleSave()
     }
 
-    func revealSelectedInFinder() {
-        guard let link = selectedNote?.file else { return }
+    func revealInFinder(_ id: UUID?) {
+        guard let link = note(id)?.file else { return }
         NSWorkspace.shared.activateFileViewerSelecting([link.url])
     }
 
-    // MARK: - Commands
-
-    func newNote() {
-        // Reuse a blank note rather than littering the library with empties.
-        if let blank = sorted.first(where: { $0.isEmpty && !$0.pinned && $0.file == nil }) {
-            selection = blank.id
-        } else {
-            let note = Note()
-            notes.append(note)
-            libraryChanged()
-            selection = note.id
-            scheduleSave()
-        }
-        query = ""
-        previewing = false
-        marked.removeAll()
-        markAnchor = nil
-        focusEditor()
-    }
-
-    func delete(_ id: UUID) {
-        delete(ids: [id])
-    }
+    // MARK: - Library commands
 
     /// Remove a whole set in one pass. Deleting them one at a time re-sorted the
     /// library and re-picked a neighbour after each one, so a sweep of twenty
     /// notes moved the editor twenty times on its way to the note it settles on.
+    ///
+    /// Every window gets a say: each one works out where its sidebar was before
+    /// the notes go, then closes the tabs that held them and lands somewhere
+    /// sensible afterwards.
     func delete(ids: Set<UUID>) {
         guard !ids.isEmpty, notes.contains(where: { ids.contains($0.id) }) else { return }
-        let wasSelected = selection.map { ids.contains($0) } ?? false
-        // Where the topmost casualty sat, so the editor lands on its neighbour.
-        let row = visible.firstIndex { ids.contains($0.id) }
+        let plans = liveWorkspaces.map { ($0, $0.planRemoval(of: ids)) }
 
         notes.removeAll { ids.contains($0.id) }
         unflushed.subtract(ids)
         brokenLinks.subtract(ids)
-        marked.subtract(ids)
-        if let anchor = markAnchor, ids.contains(anchor) { markAnchor = nil }
+        // An empty library has nowhere for a window to land.
+        if notes.isEmpty { notes.append(Note()) }
         libraryChanged()
 
-        if wasSelected {
-            let remaining = visible
-            if let row, !remaining.isEmpty {
-                selection = remaining[min(row, remaining.count - 1)].id
-            } else {
-                selection = remaining.first?.id
-            }
-        }
-        if notes.isEmpty { newNote() }
+        for (workspace, row) in plans { workspace.applyRemoval(of: ids, row: row) }
         scheduleSave()
-    }
-
-    func deleteSelected() {
-        requestDelete(actionTargets)
-    }
-
-    /// Empty notes go quietly; anything with words in it — or a file behind it —
-    /// asks first.
-    func requestDelete(_ note: Note) {
-        if note.isEmpty, note.file == nil {
-            delete(note.id)
-        } else {
-            pendingDelete = note
-        }
-    }
-
-    /// The same question asked of a whole set. One note keeps the singular
-    /// wording it always had; a set of nothing but blank, unlinked notes still
-    /// goes quietly.
-    func requestDelete(_ targets: [Note]) {
-        guard !targets.isEmpty else { return }
-        if targets.count == 1 {
-            requestDelete(targets[0])
-        } else if targets.allSatisfy({ $0.isEmpty && $0.file == nil }) {
-            delete(ids: Set(targets.map(\.id)))
-        } else {
-            pendingBulkDelete = targets
-        }
-    }
-
-    func confirmPendingDelete() {
-        guard let note = pendingDelete else { return }
-        pendingDelete = nil
-        delete(note.id)
-    }
-
-    func confirmPendingBulkDelete() {
-        guard let targets = pendingBulkDelete else { return }
-        pendingBulkDelete = nil
-        delete(ids: Set(targets.map(\.id)))
-    }
-
-    func togglePin(_ id: UUID) {
-        guard let index = position(of: id) else { return }
-        notes[index].pinned.toggle()
-        libraryChanged()
-        scheduleSave()
-    }
-
-    func togglePinSelected() {
-        togglePin(actionTargets)
     }
 
     /// Pin the whole set — or unpin it, once every note in it is already
@@ -798,312 +580,31 @@ final class NoteStore: ObservableObject {
     }
 
     /// A duplicate is a note, never a second writer on the same file.
-    func duplicateSelected() {
-        duplicate(actionTargets)
-    }
-
-    func duplicate(_ targets: [Note]) {
-        guard !targets.isEmpty else { return }
+    func duplicate(_ targets: [Note]) -> [UUID] {
+        guard !targets.isEmpty else { return [] }
         let copies = targets.map { Note(text: $0.text) }
         notes.append(contentsOf: copies)
         libraryChanged()
-        // The copies become the sweep, so whatever you do next lands on them
-        // rather than on the originals you just copied.
-        marked = copies.count > 1 ? Set(copies.map(\.id)) : []
-        markAnchor = copies.first?.id
-        selection = copies.first?.id
         scheduleSave()
+        return copies.map(\.id)
     }
 
-    // MARK: - Multi-selection
-
-    /// A plain click: one note, and the anchor a later shift-click measures from.
-    func choose(_ id: UUID) {
-        marked.removeAll()
-        markAnchor = id
-        selection = id
-    }
-
-    /// Command-click: tick or untick one note without disturbing the rest.
-    func toggleMark(_ id: UUID) {
-        if marked.contains(id) {
-            marked.remove(id)
-        } else {
-            // The first tick brings the open note in with it — otherwise
-            // ticking a second note would silently drop the first.
-            if marked.isEmpty, let selection, selection != id { marked.insert(selection) }
-            marked.insert(id)
-            selection = id
-        }
-        markAnchor = id
-    }
-
-    /// Shift-click: everything between the anchor and here. The anchor stays
-    /// put, so shift-clicking again re-measures from the same place rather than
-    /// growing the range one note at a time.
-    func extendMark(to id: UUID) {
-        let list = visible
-        guard let end = list.firstIndex(where: { $0.id == id }) else { return }
-        let anchor = (markAnchor ?? selection).flatMap { start in list.firstIndex { $0.id == start } }
-        guard let anchor else { choose(id); return }
-        let span = anchor <= end ? anchor...end : end...anchor
-        marked = Set(list[span].map(\.id))
-        selection = id
-    }
-
-    /// Tick everything the sidebar is showing — a search narrows what "all"
-    /// means, which is the point of running one first.
-    func markAll() {
-        sidebarVisible = true
-        let list = visible
-        guard !list.isEmpty else { return }
-        marked = Set(list.map(\.id))
-        if markAnchor == nil { markAnchor = selection ?? list.first?.id }
-    }
-
-    func clearMarks() {
-        marked.removeAll()
-        markAnchor = selection
-    }
-
-    func toggleMarkAll() {
-        let list = visible
-        if !marked.isEmpty, marked.count >= list.count { clearMarks() } else { markAll() }
-    }
-
-    func step(_ offset: Int) {
-        let list = visible
-        guard !list.isEmpty else { return }
-        guard let current = selection, let index = list.firstIndex(where: { $0.id == current }) else {
-            selection = list.first?.id
-            return
-        }
-        let next = (index + offset + list.count) % list.count
-        selection = list[next].id
-    }
-
-    /// Menu commands are built outside any view, so they can't see whether the
-    /// current document has markdown in it — the guard lives here instead.
-    func togglePreview() {
-        guard canPreview || previewing else { return }
-        previewing.toggle()
-    }
-
-    func focusSearch() {
-        sidebarVisible = true
-        searchFocusToken &+= 1
-    }
-
-    func focusEditor() {
-        editorFocusToken &+= 1
-    }
-
-    // MARK: - Find in the open document
-
-    /// ⌘F. Searches whatever is on screen: the text you're writing, or — with
-    /// the preview up — the words as they're rendered, markers and all left out
-    /// of it. Reading never has to become editing to find something.
-    func showFind() {
-        guard selectedNote != nil else { return }
-        withAnimation(.easeOut(duration: 0.18)) { findVisible = true }
-        findFocusToken &+= 1
-        refreshFind(reveal: true)
-    }
-
-    func hideFind() {
-        guard findVisible else { return }
-        withAnimation(.easeOut(duration: 0.18)) { findVisible = false }
-        findRecount?.cancel()
-        findMatches = []
-        findIndex = 0
-        findCapped = false
-        rendered = nil
-        focusEditor()
-    }
-
-    func toggleFind() {
-        // ⌘F on an open bar puts the cursor back in it and selects what's there,
-        // rather than closing the thing you just asked for.
-        if findVisible { findFocusToken &+= 1 } else { showFind() }
-    }
-
-    func findNext() { step(find: 1) }
-    func findPrevious() { step(find: -1) }
-
-    private func step(find direction: Int) {
-        guard selectedNote != nil else { return }
-        guard findVisible, !findQuery.isEmpty else { return showFind() }
-        guard !findMatches.isEmpty else { return }
-        // Off either end and you come round the other side.
-        findIndex = (findIndex - 1 + direction + findMatches.count) % findMatches.count + 1
-        findRevealToken &+= 1
-    }
-
-    /// Count the matches in the open document.
-    ///
-    /// A fresh search starts from the caret — the line the writer is already
-    /// looking at — and wraps round to the top if there's nothing below it. A
-    /// recount after an edit keeps whichever match you were on.
-    private func refreshFind(reveal: Bool, from anchor: Int? = nil) {
-        findRecount?.cancel()
-
-        guard findVisible, !findQuery.isEmpty, let text = selectedNote?.text else {
-            findMatches = []
-            findIndex = 0
-            findCapped = false
-            return
-        }
-
-        findMatches = matches(in: text)
-        findCapped = findMatches.count >= Self.findMatchLimit
-        guard !findMatches.isEmpty else {
-            findIndex = 0
-            return
-        }
-
-        if reveal {
-            // From the caret when there's a caret to start from; a reader has
-            // none, so a search of the preview starts at the top.
-            let caret = readingRendered ? 0 : anchor ?? EditorTextView.current?.selectedRange().location ?? 0
-            findIndex = (findMatches.firstIndex { $0.range.location >= caret } ?? 0) + 1
-            findRevealToken &+= 1
-        } else {
-            findIndex = min(max(findIndex, 1), findMatches.count)
-        }
-    }
-
-    /// True when what's on screen is the rendered markdown rather than the text.
-    private var readingRendered: Bool {
-        previewing && (selectedNote?.kind.rendersMarkdown ?? false)
-    }
-
-    /// Search whichever text the reader is actually looking at.
-    private func matches(in text: String) -> [FindMatch] {
-        guard readingRendered else {
-            return Self.ranges(of: findQuery, in: text)
-                .map { FindMatch(range: $0, block: nil) }
-        }
-
-        var found: [FindMatch] = []
-        for (index, block) in visibleBlocks(of: text).enumerated() {
-            guard found.count < Self.findMatchLimit else { break }
-            found += Self.ranges(of: findQuery, in: block)
-                .map { FindMatch(range: $0, block: index) }
-        }
-        return found
-    }
-
-    /// A letter typed into the find field.
-    ///
-    /// The same bargain the recount after an edit makes, for the same reason:
-    /// counting is fast but not free, and typing "receive" into a 4 MB document
-    /// asked for seven passes over it where one will do. Emptying the field
-    /// clears the bar at once — nobody should watch stale highlights fade.
-    private func findQueryChanged() {
-        findRecount?.cancel()
-        guard findVisible, !findQuery.isEmpty,
-              let text = selectedNote?.text, text.utf8.count > Self.instantFindLimit
-        else { return refreshFind(reveal: true) }
-
-        findRecount = Task { [weak self] in
-            try? await Task.sleep(nanoseconds: 150_000_000)
-            guard !Task.isCancelled else { return }
-            self?.refreshFind(reveal: true)
-        }
-    }
-
-    /// Recount after an edit. A note is counted there and then; a document big
-    /// enough for the pass to be felt waits for the keys to stop.
-    private func scheduleFindRecount(length: Int) {
-        guard length > Self.instantFindLimit else { return refreshFind(reveal: false) }
-        findRecount?.cancel()
-        findRecount = Task { [weak self] in
-            try? await Task.sleep(nanoseconds: 250_000_000)
-            guard !Task.isCancelled else { return }
-            self?.refreshFind(reveal: false)
-        }
-    }
-
-    private func visibleBlocks(of text: String) -> [String] {
-        if let rendered, rendered.text == text { return rendered.blocks }
-        let blocks = MarkdownPreview.visibleBlocks(of: text)
-        rendered = (text, blocks)
-        return blocks
-    }
-
-    /// Every occurrence, ignoring case and accents — the same forgiving match
-    /// the sidebar's search uses, and now by the same two roads.
-    ///
-    /// The sidebar stopped asking Foundation for this because
-    /// `range(of:options:)` manages about 40 MB/s; the find bar was still
-    /// paying it over the whole document for every letter typed into the field.
-    /// An ASCII query in an ASCII document needs none of that machinery — case
-    /// folding is one bit, accent folding is nothing, and a UTF-8 offset *is*
-    /// the UTF-16 offset, so the fast scan can hand back ranges the editor and
-    /// the preview can use unchanged. Anything else goes back to Foundation,
-    /// which is the only thing that knows what "café" folds onto.
-    private static func ranges(of query: String, in text: String) -> [NSRange] {
-        if let needle = Note.asciiFolded(query), let found = asciiRanges(of: needle, in: text) {
-            return found
-        }
-        return foundationRanges(of: query, in: text as NSString)
-    }
-
-    /// Where an ASCII needle sits in plain ASCII text, or nil the moment the
-    /// text turns out not to be plain: past a high byte the offsets stop
-    /// meaning UTF-16, and what folds onto what stops being ours to say.
-    private static func asciiRanges(of needle: [UInt8], in text: String) -> [NSRange]? {
-        let scanned: [NSRange]?? = text.utf8.withContiguousStorageIfAvailable { haystack in
-            var found: [NSRange] = []
-            var index = 0
-            let count = haystack.count
-            let last = count - needle.count
-            while index < count, found.count < findMatchLimit {
-                let byte = haystack[index]
-                if byte >= 0x80 { return nil }
-                if index <= last, Note.fold(byte) == needle[0] {
-                    var offset = 1
-                    while offset < needle.count, Note.fold(haystack[index + offset]) == needle[offset] {
-                        offset += 1
-                    }
-                    if offset == needle.count {
-                        found.append(NSRange(location: index, length: needle.count))
-                        index += needle.count
-                        continue
-                    }
-                }
-                index += 1
-            }
-            return found
-        }
-        return scanned ?? nil
-    }
-
-    private static func foundationRanges(of query: String, in text: NSString) -> [NSRange] {
-        var found: [NSRange] = []
-        var start = 0
-        let options: NSString.CompareOptions = [.caseInsensitive, .diacriticInsensitive]
-        while start < text.length, found.count < findMatchLimit {
-            let searched = NSRange(location: start, length: text.length - start)
-            let range = text.range(of: query, options: options, range: searched)
-            guard range.location != NSNotFound, range.length > 0 else { break }
-            found.append(range)
-            start = NSMaxRange(range)
-        }
-        return found
-    }
-
-    /// ⌘E — take what's selected in the editor as the thing to find.
-    func useSelectionForFind() {
-        guard let selected = EditorTextView.selectedText, !selected.isEmpty else { return }
-        findQuery = selected
-        showFind()
+    func copy(_ targets: [Note]) {
+        guard !targets.isEmpty else { return }
+        // One note copies as itself. Several are stitched together under their
+        // own titles, so what lands in the paste can still be read apart.
+        let text = targets.count == 1
+            ? targets[0].text
+            : targets.map { "# \($0.title)\n\n\($0.text)" }.joined(separator: "\n\n---\n\n")
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(text, forType: .string)
     }
 
     /// Write the note out to a file of the user's choosing — and keep writing
-    /// there from then on, the way Save As has always behaved.
-    func saveSelectedAs() {
-        guard let index = selectedIndex else { return }
+    /// there from then on, the way Save As has always behaved. Returns a
+    /// message only when something went wrong.
+    func saveAs(_ id: UUID) -> PoeMessage? {
+        guard let index = position(of: id) else { return nil }
         let note = notes[index]
 
         let panel = NSSavePanel()
@@ -1121,35 +622,23 @@ final class NoteStore: ObservableObject {
             panel.allowedContentTypes = [UTType(filenameExtension: "md") ?? .plainText]
         }
 
-        guard panel.runModal() == .OK, let url = panel.url else { return }
+        guard panel.runModal() == .OK, let url = panel.url else { return nil }
+        // The panel ran the loop; the note may have moved in the meantime.
+        guard let index = position(of: id) else { return nil }
 
         var link = note.file ?? FileLink(path: url.path)
         link.path = url.standardizedFileURL.path
         do {
-            try TextFile.write(note.text, to: link)
+            try TextFile.write(notes[index].text, to: link)
             notes[index].file = link
             unflushed.remove(notes[index].id)
             brokenLinks.remove(notes[index].id)
             libraryChanged()
             scheduleSave()
+            return nil
         } catch {
-            message = PoeMessage(title: "Couldn’t save", body: error.localizedDescription)
+            return PoeMessage(title: "Couldn’t save", body: error.localizedDescription)
         }
-    }
-
-    func copySelectedToPasteboard() {
-        copy(actionTargets)
-    }
-
-    func copy(_ targets: [Note]) {
-        guard !targets.isEmpty else { return }
-        // One note copies as itself. Several are stitched together under their
-        // own titles, so what lands in the paste can still be read apart.
-        let text = targets.count == 1
-            ? targets[0].text
-            : targets.map { "# \($0.title)\n\n\($0.text)" }.joined(separator: "\n\n---\n\n")
-        NSPasteboard.general.clearContents()
-        NSPasteboard.general.setString(text, forType: .string)
     }
 
     /// Write a copy of each note into a folder of the user's choosing.
@@ -1157,8 +646,8 @@ final class NoteStore: ObservableObject {
     /// Deliberately not Save As: exporting a sweep of twenty notes should not
     /// leave twenty files that Poe now writes to on every keystroke. The notes
     /// stay notes, and nothing already in the folder is overwritten.
-    func export(_ targets: [Note]) {
-        guard !targets.isEmpty else { return }
+    func export(_ targets: [Note]) -> PoeMessage? {
+        guard !targets.isEmpty else { return nil }
 
         let panel = NSOpenPanel()
         panel.canChooseFiles = false
@@ -1169,7 +658,7 @@ final class NoteStore: ObservableObject {
         panel.message = targets.count == 1
             ? "Choose a folder to export this note into"
             : "Choose a folder to export \(targets.count) notes into"
-        guard panel.runModal() == .OK, let folder = panel.url else { return }
+        guard panel.runModal() == .OK, let folder = panel.url else { return nil }
 
         var taken: Set<String> = []
         var exported = 0
@@ -1200,16 +689,15 @@ final class NoteStore: ObservableObject {
         }
 
         if failed.isEmpty {
-            message = PoeMessage(
+            return PoeMessage(
                 title: exported == 1 ? "Exported 1 note" : "Exported \(exported) notes",
                 body: "Written to \(folder.path)."
             )
-        } else {
-            message = PoeMessage(
-                title: "Couldn’t export everything",
-                body: "\(exported) written to \(folder.path). These couldn’t be: \(failed.joined(separator: ", "))."
-            )
         }
+        return PoeMessage(
+            title: "Couldn’t export everything",
+            body: "\(exported) written to \(folder.path). These couldn’t be: \(failed.joined(separator: ", "))."
+        )
     }
 
     private func sanitize(_ name: String) -> String {
@@ -1227,15 +715,25 @@ final class NoteStore: ObservableObject {
 
     ## Shortcuts
     - Cmd N — new note
+    - Cmd T — new note in a new tab
+    - Shift Cmd N — new window
+    - Cmd W — close tab · Shift Cmd T — reopen it
+    - Cmd 1…9, Shift Cmd [ and ] — switch tabs
     - Cmd O — open a file (.md, .txt, code, anything text)
     - Cmd F — find inside this note
     - Shift Cmd F — search every note
     - Cmd P — preview markdown
+    - Cmd B / Cmd I / Cmd K — bold, italic, link
+    - Shift Cmd L — turn a line into a checklist item, or tick it
     - Cmd D — pin the current note
     - Cmd 0 — hide the sidebar for focus mode
     - Cmd Backspace — remove the current note
 
     Markdown works: **bold**, *italic*, `code`, and [links](https://example.com).
+    Lists carry on by themselves when you press Return.
+
+    - [ ] Option-click a note in the sidebar to open it in a new tab
+    - [ ] Right-click one to open it in its own window
 
     Open a file and Poe edits it in place — every keystroke goes straight back to
     the file on disk, in its own encoding and line endings. Drag one onto the

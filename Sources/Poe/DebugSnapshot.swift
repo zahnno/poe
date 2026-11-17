@@ -8,6 +8,9 @@ import QuartzCore
 /// settling (POE_BENCH_NOTES / POE_BENCH_SIZE / POE_BENCH_STROKES).
 @MainActor
 enum DebugSnapshot {
+    /// The window in front — what the harness drives.
+    private static var store: Workspace { Workspace.active ?? NoteStore.shared.liveWorkspaces[0] }
+
     static func runIfRequested() {
         guard let base = ProcessInfo.processInfo.environment["POE_SNAPSHOT"] else { return }
         guard let scenario = ProcessInfo.processInfo.environment["POE_SELFTEST"] else {
@@ -71,6 +74,13 @@ enum DebugSnapshot {
             return
         }
 
+        // POE_SELFTEST=tabs opens tabs and a second window, edits and deletes
+        // across them, and puts the markdown shortcuts through their paces.
+        if scenario == "tabs" {
+            tabsFlow(base: base)
+            return
+        }
+
         if scenario == "live" {
             LiveBench.run()
             return
@@ -126,7 +136,6 @@ enum DebugSnapshot {
         let folder = url.deletingLastPathComponent()
         let binary = folder.appendingPathComponent("binary.dat")
         let before = (try? String(contentsOf: url, encoding: .utf8)) ?? ""
-        let store = NoteStore.shared
 
         after(start) { store.open([url]) }
 
@@ -238,7 +247,6 @@ enum DebugSnapshot {
     ///
     /// The word below appears exactly six times, counting the shouted one.
     private static func findFlow(base: String, start: Double = 2.0) {
-        let store = NoteStore.shared
         let text = """
         Lantern notes
 
@@ -378,7 +386,6 @@ enum DebugSnapshot {
     /// which is what a search used to leave behind, its jump having stranded
     /// the styled window somewhere the reader no longer was.
     private static func scrollFlow() {
-        let store = NoteStore.shared
         var body = "Long Note\n\n"
         var paragraph = 0
         while body.utf8.count < 40_000 {
@@ -477,8 +484,200 @@ enum DebugSnapshot {
     /// Multi-selection end to end: tick a run of notes, pin them, duplicate
     /// them, and delete them — checking after each that the sweep acted on
     /// every note it claimed to and on none that it didn't.
+    /// Tabs, windows, and writing markdown.
+    private static func tabsFlow(base: String) {
+        var list: [Note] = []
+        var first: Workspace!
+        var second: Workspace!
+
+        func setText(_ textView: NSTextView?, _ text: String) {
+            guard let textView else { return }
+            textView.window?.makeFirstResponder(textView)
+            let all = NSRange(location: 0, length: (textView.string as NSString).length)
+            textView.insertText(text, replacementRange: all)
+            textView.setSelectedRange(NSRange(location: (textView.string as NSString).length, length: 0))
+        }
+
+        after(1.5) {
+            first = store
+            for index in 1...4 {
+                store.newNote()
+                store.currentText.wrappedValue = "Tab note \(index)\n\nBody \(index)."
+            }
+            list = store.visible.filter { $0.text.hasPrefix("Tab note") }
+            check("four notes to open (\(list.count))", list.count == 4)
+
+            check("⌘W closes a tab", shortcutOwner("w", .command) == "Close Tab")
+            check("⇧⌘W closes the window", shortcutOwner("w", [.command, .shift]) == "Close Window")
+            check("⌘T opens a tab", shortcutOwner("t", .command) == "New Tab")
+            check("⇧⌘T reopens one", shortcutOwner("t", [.command, .shift]) == "Reopen Closed Tab")
+            check("⇧⌘N opens a window", shortcutOwner("n", [.command, .shift]) == "New Window")
+            check("⌘1 picks the first tab", shortcutOwner("1", .command) == "Tab 1")
+            check("⌘B is bold", shortcutOwner("b", .command) == "Bold")
+        }
+
+        after(2.0) {
+            store.choose(list[0].id)
+            check("one tab to start with (\(store.tabs.count))", store.tabs.count == 1)
+            store.openInNewTab(list[1].id)
+            check("a second tab opens beside it", store.tabs == [list[0].id, list[1].id])
+            check("and comes to the front", store.selection == list[1].id)
+            trigger("New Tab")
+            check("⌘T adds a blank tab (\(store.tabs.count))", store.tabs.count == 3 && store.selectedNote?.isEmpty == true)
+            store.openInNewTab(list[1].id)
+            check("opening an open note just switches to it", store.tabs.count == 3 && store.selection == list[1].id)
+        }
+
+        after(2.6) {
+            capture(to: base + "-tabs.png", window: first.editor?.window)
+            eventually("the editor follows the tab") { first.editor?.string == list[1].text }
+            store.selectTab(at: 1)
+            check("⌘1 goes to the first tab", store.selection == list[0].id)
+            store.selectTab(at: 9)
+            check("⌘9 goes to the last tab", store.selection == store.tabs.last)
+            trigger("Show Next Tab")
+            check("next tab wraps round to the first", store.selection == list[0].id)
+            trigger("Show Previous Tab")
+            check("previous tab wraps back to the last", store.selection == store.tabs.last)
+
+            store.selectTab(list[1].id)
+            trigger("Close Tab")
+            check("⌘W closes the tab in front (\(store.tabs.count))", store.tabs.count == 2 && !store.tabs.contains(list[1].id))
+            trigger("Reopen Closed Tab")
+            check("⇧⌘T brings it back", store.tabs.count == 3 && store.selection == list[1].id)
+
+            store.choose(list[2].id)
+            check("choosing a note navigates the tab in front",
+                  store.tabs.count == 3 && store.selection == list[2].id && !store.tabs.contains(list[1].id))
+            store.selectTab(list[0].id)
+        }
+
+        after(3.4) {
+            trigger("New Window")
+        }
+
+        after(5.0) {
+            let windows = NoteStore.shared.liveWorkspaces
+            check("a second window opened (\(windows.count))", windows.count == 2)
+            second = windows.first { $0 !== first }
+            // Whether the app itself is frontmost depends on what else is on
+            // screen; making the window key is what this is really about.
+            second?.editor?.window?.makeKeyAndOrderFront(nil)
+            if NSApp.isActive {
+                check("the window in front is the one commands go to", Workspace.active === second)
+            } else {
+                print("SELFTEST: skip the window in front (Poe isn't the active app)")
+            }
+            check("it starts on its own page", second?.selection != first.selection && second?.tabs.count == 1)
+            check("the first window kept its tabs", first.tabs.count == 3 && first.selection == list[0].id)
+            check("each window has its own editor",
+                  first.editor != nil && second?.editor != nil && first.editor !== second?.editor)
+            second?.openInNewTab(list[0].id)
+            check("the same note can be open in both", second?.selection == list[0].id)
+        }
+
+        after(5.6) {
+            setText(second.editor, "Tab note 1 — edited in the other window")
+            check("the edit reaches the library", NoteStore.shared.note(list[0].id)?.text.hasSuffix("other window") == true)
+            // A window hidden behind another one isn't redrawn until it shows.
+            first.editor?.window?.orderFront(nil)
+            eventually("the first window shows it too") {
+                first.editor?.string == "Tab note 1 — edited in the other window"
+            }
+            capture(to: base + "-second-window.png", window: second.editor?.window)
+        }
+
+        after(7.0) {
+            second.delete(list[0].id)
+            check("deleting closes its tab in this window", second.tabs.contains(list[0].id) == false && second.selection != nil)
+            check("and in the other one", !first.tabs.contains(list[0].id) && first.tabs.count == 2)
+            check("which lands on a tab still open", first.selection.map { first.tabs.contains($0) } == true)
+            second.editor?.window?.performClose(nil)
+        }
+
+        after(8.0) {
+            eventually("closing the window lets its workspace go") { NoteStore.shared.liveWorkspaces.count == 1 }
+            first.editor?.window?.makeKeyAndOrderFront(nil)
+        }
+
+        after(9.0) {
+            store.newTab()
+            let editor = first.editor
+            setText(editor, "- one")
+            editor?.doCommand(by: #selector(NSResponder.insertNewline(_:)))
+            check("Return carries a list on", editor?.string == "- one\n- ")
+            editor?.doCommand(by: #selector(NSResponder.insertNewline(_:)))
+            check("Return on an empty item ends it", editor?.string == "- one\n")
+            setText(editor, "1. first")
+            editor?.doCommand(by: #selector(NSResponder.insertNewline(_:)))
+            check("a numbered list counts on", editor?.string == "1. first\n2. ")
+            setText(editor, "- [x] done")
+            editor?.doCommand(by: #selector(NSResponder.insertNewline(_:)))
+            check("a checklist carries on with an empty box", editor?.string == "- [x] done\n- [ ] ")
+            setText(editor, "plain line")
+            editor?.doCommand(by: #selector(NSResponder.insertNewline(_:)))
+            check("Return outside a list is just Return", editor?.string == "plain line\n")
+
+            setText(editor, "buy milk")
+            store.format(.checklist)
+            check("⇧⌘L makes a checklist item", editor?.string == "- [ ] buy milk")
+            check("and the caret stays at the end", editor?.selectedRange().location == 14)
+            store.format(.checklist)
+            check("⇧⌘L again ticks it", editor?.string == "- [x] buy milk")
+            store.format(.checklist)
+            check("and again unticks it", editor?.string == "- [ ] buy milk")
+
+            editor?.setSelectedRange(NSRange(location: 10, length: 4))
+            store.format(.bold)
+            check("⌘B wraps the selection", editor?.string == "- [ ] buy **milk**")
+            check("and keeps the word selected", editor?.selectedRange() == NSRange(location: 12, length: 4))
+            store.format(.italic)
+            check("⌘I inside bold makes it bold italic", editor?.string == "- [ ] buy ***milk***")
+            store.format(.italic)
+            check("⌘I again takes only the italic away", editor?.string == "- [ ] buy **milk**")
+        }
+
+        // A key press is an event, and AppKit closes the open undo group at
+        // each one. A harness makes no events of its own, so it posts one.
+        after(9.15) {
+            if let event = NSEvent.otherEvent(with: .applicationDefined, location: .zero, modifierFlags: [],
+                                              timestamp: 0, windowNumber: 0, context: nil,
+                                              subtype: 0, data1: 0, data2: 0) {
+                NSApp.postEvent(event, atStart: false)
+            }
+        }
+
+        after(9.3) {
+            store.format(.bold)
+            check("⌘B again unwraps it", first.editor?.string == "- [ ] buy milk")
+        }
+
+        // AppKit closes an undo group once per turn of the run loop, which is
+        // once per key press for a writer — so the undo waits for the next turn.
+        after(9.6) {
+            let editor = first.editor
+            editor?.undoManager?.undo()
+            check("each shortcut is one undo step (\(editor?.string ?? "nil"))", editor?.string == "- [ ] buy **milk**")
+            editor?.setSelectedRange(NSRange(location: 12, length: 4))
+            NSPasteboard.general.clearContents()
+            store.format(.link)
+            check("⌘K makes a link with the address to fill in (\(editor?.string ?? ""))", editor?.string == "- [ ] buy **[milk](url)**")
+            check("the store heard every change", store.selectedNote?.text == editor?.string)
+        }
+
+        after(10.0) {
+            store.previewing = true
+            let before = store.selectedNote?.text
+            store.format(.bold)
+            check("shortcuts do nothing while reading", store.selectedNote?.text == before)
+            store.previewing = false
+            capture(to: base + "-final.png", window: first.editor?.window)
+            print("SELFTEST: \(failures) failed check(s)")
+            NSApp.terminate(nil)
+        }
+    }
+
     private static func selectFlow(base: String) {
-        let store = NoteStore.shared
 
         after(1.5) {
             // A library with enough in it that a range means something.
@@ -598,7 +797,6 @@ enum DebugSnapshot {
     /// the top, the middle and the end, deleting, replacing a selection, pasting
     /// a fence in, undoing it, and swapping the document out from under it.
     private static func fenceFlow() {
-        let store = NoteStore.shared
 
         let document = """
         Title
@@ -677,7 +875,6 @@ enum DebugSnapshot {
     /// after each one, so the measurement includes everything the keystroke set
     /// in motion, not just the insert.
     private static func benchFlow() {
-        let store = NoteStore.shared
         let notes = Int(ProcessInfo.processInfo.environment["POE_BENCH_NOTES"] ?? "") ?? 20
         let size = Int(ProcessInfo.processInfo.environment["POE_BENCH_SIZE"] ?? "") ?? 40_000
         let strokes = Int(ProcessInfo.processInfo.environment["POE_BENCH_STROKES"] ?? "") ?? 150
@@ -767,7 +964,6 @@ enum DebugSnapshot {
     """
 
     private static func state(_ label: String) {
-        let store = NoteStore.shared
         let notes = store.notes.map { "\($0.text.count)ch\($0.id == store.selection ? "*" : "")" }.joined(separator: " ")
         let file = store.selectedNote?.file.map { " file=\($0.name)" } ?? ""
         print("SELFTEST [\(label)] preview=\(store.previewing) sidebar=\(store.sidebarVisible) notes=[\(notes)]\(file) editor=\(findTextView()?.string.count ?? -1)ch")
@@ -777,8 +973,8 @@ enum DebugSnapshot {
         DispatchQueue.main.asyncAfter(deadline: .now() + seconds, execute: block)
     }
 
-    private static func capture(to path: String) {
-        guard let window = mainWindow, let view = window.contentView else { return }
+    private static func capture(to path: String, window chosen: NSWindow? = nil) {
+        guard let window = chosen ?? mainWindow, let view = window.contentView else { return }
         // An occluded window stops redrawing, so a capture can otherwise write a
         // frame from several seconds ago. Bring it forward and flush first.
         window.orderFrontRegardless()

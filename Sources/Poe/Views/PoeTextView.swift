@@ -34,6 +34,9 @@ struct PoeTextView: NSViewRepresentable {
     var themeID: String = ""
     /// Esc with the find bar up. Returns true if there was a bar to close.
     var onEscape: () -> Bool = { false }
+    /// Hands the window its text view, so find and the markdown shortcuts work
+    /// on this window's editor rather than whichever one was built last.
+    var onAttach: (NSTextView) -> Void = { _ in }
 
     /// Everything the editor needs to draw a search, as one comparable value.
     struct FindState: Equatable {
@@ -111,13 +114,14 @@ struct PoeTextView: NSViewRepresentable {
 
         context.coordinator.apply(to: textView)
         context.coordinator.watchScrolling(of: scrollView)
-        EditorTextView.register(textView)
+        onAttach(textView)
         return scrollView
     }
 
     func updateNSView(_ scrollView: NSScrollView, context: Context) {
         guard let textView = scrollView.documentView as? NSTextView else { return }
         context.coordinator.parent = self
+        onAttach(textView)
 
         textView.isContinuousSpellCheckingEnabled = styled
         scrollView.scrollerKnobStyle = ThemeManager.shared.currentTheme.isLight ? .dark : .light
@@ -438,7 +442,13 @@ struct PoeTextView: NSViewRepresentable {
 
         /// Esc closes the find bar from the editor too, the way it does from the
         /// field itself — the writer shouldn't have to reach back for it.
+        ///
+        /// Return inside a markdown list starts the next item, or ends the list
+        /// on an empty one.
         func textView(_ textView: NSTextView, doCommandBy selector: Selector) -> Bool {
+            if selector == #selector(NSResponder.insertNewline(_:)), parent.kind.rendersMarkdown {
+                return MarkdownEditing.continueList(in: textView)
+            }
             guard selector == #selector(NSResponder.cancelOperation(_:)) else { return false }
             return parent.onEscape()
         }
@@ -583,50 +593,5 @@ struct PoeTextView: NSViewRepresentable {
         deinit {
             NotificationCenter.default.removeObserver(self)
         }
-    }
-}
-
-
-
-
-/// The editor's text view, wherever it currently is in the window.
-///
-/// ⌘E is a menu command, and menu commands live outside every view — so the one
-/// thing it needs, the writer's selection, has to be fetched from the responder
-/// tree by hand.
-enum EditorTextView {
-    /// The editor registers itself when it is built, so finding it later is a
-    /// lookup rather than a walk of every view in every window — which is what
-    /// ⌘F did, on each recount, to ask where the caret was.
-    private static weak var registered: NSTextView?
-
-    static func register(_ textView: NSTextView) { registered = textView }
-
-    static var current: NSTextView? {
-        if let registered, registered.window != nil { return registered }
-        for window in NSApp.windows where window.isVisible {
-            if let root = window.contentView, let found = search(root) {
-                registered = found
-                return found
-            }
-        }
-        return nil
-    }
-
-    static var selectedText: String? {
-        guard let textView = current else { return nil }
-        let range = textView.selectedRange()
-        guard range.length > 0 else { return nil }
-        return (textView.string as NSString).substring(with: range)
-    }
-
-    private static func search(_ view: NSView) -> NSTextView? {
-        if let textView = view as? NSTextView, textView.identifier == PoeTextView.identifier {
-            return textView
-        }
-        for subview in view.subviews {
-            if let found = search(subview) { return found }
-        }
-        return nil
     }
 }

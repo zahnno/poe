@@ -2,8 +2,9 @@ import AppKit
 import SwiftUI
 
 struct EditorView: View {
-    @EnvironmentObject var store: NoteStore
+    @EnvironmentObject var store: Workspace
     @ObservedObject private var themeManager = ThemeManager.shared
+    @Environment(\.openWindow) private var openWindow
 
     private var note: Note? { store.selectedNote }
     private var linkBroken: Bool {
@@ -14,6 +15,11 @@ struct EditorView: View {
     var body: some View {
         VStack(spacing: 0) {
             topBar
+            if store.tabs.count > 1 {
+                Divider().overlay(Theme.hairline)
+                TabStrip()
+                    .transition(.move(edge: .top).combined(with: .opacity))
+            }
             if store.findVisible {
                 FindBar()
                     .transition(.move(edge: .top).combined(with: .opacity))
@@ -23,6 +29,7 @@ struct EditorView: View {
             Divider().overlay(Theme.hairline)
             statusBar
         }
+        .animation(.easeOut(duration: 0.18), value: store.tabs.count > 1)
     }
 
     // MARK: - Top bar
@@ -92,7 +99,15 @@ struct EditorView: View {
             .help(previewHelp)
 
             Menu {
+                Button("New Tab") { store.newTab() }
                 Button("Open File…") { store.openFromPanel() }
+                if let note {
+                    Button("Open in New Window") {
+                        Workspace.pendingNote = note.id
+                        openWindow(id: PoeWindow.id)
+                    }
+                }
+                Toggle("Float on Top", isOn: $store.floating)
                 Divider()
                 Menu("Theme (\(themeManager.currentTheme.name))") {
                     Button("Next Theme") { themeManager.nextTheme() }
@@ -136,7 +151,11 @@ struct EditorView: View {
             .buttonStyle(IconButtonStyle())
         }
         .padding(.horizontal, 14)
-        .padding(.top, store.sidebarVisible ? 8 : 30)
+        // The toolbar shares the title bar's row. With the sidebar hidden the
+        // traffic lights sit at its left end, so it steps right of them rather
+        // than dropping a whole row below them.
+        .padding(.leading, store.sidebarVisible ? 0 : 64)
+        .padding(.top, 9)
         .padding(.bottom, 8)
         .animation(.spring(response: 0.38, dampingFraction: 0.86), value: store.sidebarVisible)
     }
@@ -182,6 +201,9 @@ struct EditorView: View {
                     guard store.findVisible else { return false }
                     store.hideFind()
                     return true
+                },
+                onAttach: { [weak store] textView in
+                    if store?.editor !== textView { store?.editor = textView }
                 }
             )
             .opacity(store.previewing ? 0 : 1)
